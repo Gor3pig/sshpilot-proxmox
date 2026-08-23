@@ -1,0 +1,10 @@
+{
+  "id": "proxmox",
+  "name": "Proxmox VE",
+  "version": "0.1.0",
+  "homepage": "https://github.com/Gor3pig/sshpilot-proxmox",
+  "api_version": 1,
+  "permissions": [
+    "ui"
+  ]
+}
