@@ -1,15 +1,36 @@
 """Headless tests for the minimal authenticated Proxmox VE client."""
 
 import email.message
+import importlib.util
 import io
 import socket
 import ssl
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
-import proxmox_api as api
+
+def _load_api_module():
+    module_name = "sshpilot_proxmox_api_under_test"
+    module_path = Path(__file__).resolve().parents[1] / "proxmox_api.py"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Could not load proxmox_api.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+api = _load_api_module()
 
 
 class _Response:
