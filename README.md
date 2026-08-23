@@ -2,7 +2,7 @@
 
 This project is a Proxmox VE integration plugin for SSH Pilot. It is currently
 under development and provides local endpoint configuration and an authenticated
-HTTPS connection test.
+HTTPS connection test, plus manual read-only inventory loading.
 
 ## Current status
 
@@ -13,18 +13,20 @@ validate the Proxmox VE server. The separate connection test verifies HTTPS and
 API token authentication using the saved configuration. TLS certificate
 verification is required.
 
+The **Refresh** action loads the Proxmox VE nodes, QEMU virtual machines, and LXC
+containers visible to the configured API token and displays their current
+status. Guest visibility depends on the permissions assigned to the token in
+Proxmox VE.
+
 ## Planned direction
 
-The integration is intended to:
+Future work is intended to:
 
-- browse Proxmox VE nodes;
-- browse QEMU virtual machines and LXC containers;
-- display guest status;
 - add guests as SSH Pilot connections;
 - open existing SSH Pilot connections.
 
-Inventory browsing and the other Proxmox VE features above are planned and are
-not implemented yet.
+Guest IP discovery, SSH Pilot import, power actions, automatic refresh, and a
+custom CA interface are not implemented.
 
 ## Development and testing
 
