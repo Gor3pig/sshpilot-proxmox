@@ -13,9 +13,13 @@ from dataclasses import dataclass
 from typing import Any
 
 API_PATH = "/api2/json/access/permissions"
+CLUSTER_RESOURCES_PATH = "/api2/json/cluster/resources"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+_NODE_QUERY = (("type", "node"),)
+_GUEST_QUERY = (("type", "vm"),)
 
 _MESSAGES = {
     "success": "Connection and API token authentication succeeded.",
@@ -40,6 +44,14 @@ _MESSAGES = {
     "unexpected_error": "The connection test failed.",
 }
 
+_INVENTORY_MESSAGES = {
+    **_MESSAGES,
+    "success": "Inventory loaded.",
+    "invalid_configuration": "The Proxmox VE configuration is invalid.",
+    "missing_secret": "No API token secret is available.",
+    "unexpected_error": "The inventory could not be loaded.",
+}
+
 
 @dataclass(frozen=True)
 class ConnectionTestResult:
@@ -47,6 +59,48 @@ class ConnectionTestResult:
 
     category: str
     message: str
+    http_status: int | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.category == "success"
+
+
+@dataclass(frozen=True)
+class ProxmoxNode:
+    """Minimal normalized Proxmox VE node."""
+
+    name: str
+    status: str
+
+
+@dataclass(frozen=True)
+class ProxmoxGuest:
+    """Minimal normalized QEMU or LXC guest."""
+
+    guest_type: str
+    vmid: int
+    name: str
+    node: str
+    status: str
+    template: bool
+
+
+@dataclass(frozen=True)
+class ProxmoxInventory:
+    """Immutable node and guest inventory."""
+
+    nodes: tuple[ProxmoxNode, ...]
+    guests: tuple[ProxmoxGuest, ...]
+
+
+@dataclass(frozen=True)
+class InventoryResult:
+    """Secret-free inventory outcome returned to a caller."""
+
+    category: str
+    message: str
+    inventory: ProxmoxInventory | None = None
     http_status: int | None = None
 
     @property
@@ -86,6 +140,22 @@ def connection_test_result(
     else:
         message = _MESSAGES.get(category, _MESSAGES["unexpected_error"])
     return ConnectionTestResult(category, message, http_status)
+
+
+def _inventory_result(
+    category: str,
+    *,
+    inventory: ProxmoxInventory | None = None,
+    http_status: int | None = None,
+) -> InventoryResult:
+    if category == "http_error":
+        message = f"The server returned HTTP {int(http_status or 0)}."
+    else:
+        message = _INVENTORY_MESSAGES.get(
+            category,
+            _INVENTORY_MESSAGES["unexpected_error"],
+        )
+    return InventoryResult(category, message, inventory, http_status)
 
 
 def _contains_control_characters(value: str) -> bool:
@@ -202,8 +272,141 @@ def _transport_result(error: BaseException) -> ConnectionTestResult:
     return connection_test_result("connection_error")
 
 
+def _build_api_url(
+    configuration: ProxmoxConfiguration,
+    path: str,
+    query: tuple[tuple[str, str], ...],
+) -> str:
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/api2/json/")
+        or _contains_control_characters(path)
+    ):
+        raise ProxmoxValidationError("unexpected_error")
+
+    parsed_path = urllib.parse.urlsplit(path)
+    if (
+        parsed_path.scheme
+        or parsed_path.netloc
+        or parsed_path.query
+        or parsed_path.fragment
+        or parsed_path.path != path
+    ):
+        raise ProxmoxValidationError("unexpected_error")
+
+    url = configuration.server_url + path
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+
+    server = urllib.parse.urlsplit(configuration.server_url)
+    target = urllib.parse.urlsplit(url)
+    server_origin = (server.scheme.lower(), server.hostname, server.port or 443)
+    target_origin = (target.scheme.lower(), target.hostname, target.port or 443)
+    if target_origin != server_origin:
+        raise ProxmoxValidationError("unexpected_error")
+    return url
+
+
+def _normalize_optional_text(value: Any, default: str) -> str:
+    return (
+        value
+        if (
+            isinstance(value, str)
+            and value.strip()
+            and not _contains_control_characters(value)
+        )
+        else default
+    )
+
+
+def _is_valid_node_name(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and not _contains_control_characters(value)
+    )
+
+
+def _parse_nodes(data: Any) -> tuple[ProxmoxNode, ...]:
+    if not isinstance(data, list):
+        raise ProxmoxValidationError("invalid_response")
+
+    nodes: dict[str, ProxmoxNode] = {}
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("type") != "node":
+            raise ProxmoxValidationError("invalid_response")
+        name = entry.get("node")
+        if not _is_valid_node_name(name):
+            raise ProxmoxValidationError("invalid_response")
+        node = ProxmoxNode(
+            name=name,
+            status=_normalize_optional_text(entry.get("status"), "unknown"),
+        )
+        previous = nodes.get(name)
+        if previous is not None and previous != node:
+            raise ProxmoxValidationError("invalid_response")
+        nodes[name] = node
+
+    return tuple(sorted(nodes.values(), key=lambda node: node.name))
+
+
+def _normalize_template(entry: dict[str, Any]) -> bool:
+    if "template" not in entry:
+        return False
+    value = entry["template"]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ProxmoxValidationError("invalid_response")
+
+
+def _parse_guests(data: Any) -> tuple[ProxmoxGuest, ...]:
+    if not isinstance(data, list):
+        raise ProxmoxValidationError("invalid_response")
+
+    guests: dict[int, ProxmoxGuest] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            raise ProxmoxValidationError("invalid_response")
+        guest_type = entry.get("type")
+        if guest_type not in ("qemu", "lxc"):
+            raise ProxmoxValidationError("invalid_response")
+        vmid = entry.get("vmid")
+        if (
+            not isinstance(vmid, int)
+            or isinstance(vmid, bool)
+            or not 100 <= vmid <= 999_999_999
+        ):
+            raise ProxmoxValidationError("invalid_response")
+        node = entry.get("node")
+        if not _is_valid_node_name(node):
+            raise ProxmoxValidationError("invalid_response")
+
+        guest = ProxmoxGuest(
+            guest_type=guest_type,
+            vmid=vmid,
+            name=_normalize_optional_text(entry.get("name"), ""),
+            node=node,
+            status=_normalize_optional_text(entry.get("status"), "unknown"),
+            template=_normalize_template(entry),
+        )
+        previous = guests.get(vmid)
+        if previous is not None and previous != guest:
+            raise ProxmoxValidationError("invalid_response")
+        guests[vmid] = guest
+
+    return tuple(
+        sorted(
+            guests.values(),
+            key=lambda guest: (guest.node, guest.vmid, guest.guest_type),
+        )
+    )
+
+
 class ProxmoxClient:
-    """One-request Proxmox client with strict TLS and no redirects."""
+    """Minimal Proxmox client with strict TLS and no redirects."""
 
     def __init__(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS, opener=None):
         if timeout <= 0:
@@ -211,26 +414,25 @@ class ProxmoxClient:
         self._timeout = timeout
         self._opener = opener if opener is not None else _build_opener()
 
-    def test_connection(
+    def _get_json(
         self,
         configuration: ProxmoxConfiguration,
         secret: str,
-    ) -> ConnectionTestResult:
-        """Authenticate with one read-only request and validate its JSON shape."""
+        path: str,
+        query: tuple[tuple[str, str], ...] = (),
+    ) -> tuple[ConnectionTestResult, Any]:
         authorization = None
         headers = None
         request = None
+        raw = None
         try:
+            url = _build_api_url(configuration, path, query)
             authorization = build_authorization_header(configuration, secret)
             headers = {
                 "Authorization": authorization,
                 "Accept": "application/json",
             }
-            request = urllib.request.Request(
-                configuration.endpoint_url,
-                method="GET",
-                headers=headers,
-            )
+            request = urllib.request.Request(url, method="GET", headers=headers)
             with self._opener.open(request, timeout=self._timeout) as response:
                 status = int(
                     getattr(response, "status", None)
@@ -238,29 +440,29 @@ class ProxmoxClient:
                     or 0
                 )
                 if not 200 <= status < 300:
-                    return _http_result(status)
+                    return _http_result(status), None
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
-                    return connection_test_result("invalid_response")
+                    return connection_test_result("invalid_response"), None
         except ProxmoxValidationError as exc:
-            return connection_test_result(exc.category)
+            return connection_test_result(exc.category), None
         except urllib.error.HTTPError as exc:
             try:
-                return _http_result(int(exc.code or 0))
+                return _http_result(int(exc.code or 0)), None
             finally:
                 exc.close()
         except urllib.error.URLError as exc:
-            return _transport_result(exc)
+            return _transport_result(exc), None
         except (TimeoutError, socket.timeout) as exc:
-            return _transport_result(exc)
+            return _transport_result(exc), None
         except (ssl.SSLCertVerificationError, ssl.SSLError) as exc:
-            return _transport_result(exc)
+            return _transport_result(exc), None
         except OSError as exc:
-            return _transport_result(exc)
+            return _transport_result(exc), None
         except ValueError:
-            return connection_test_result("invalid_url")
+            return connection_test_result("invalid_url"), None
         except Exception:
-            return connection_test_result("unexpected_error")
+            return connection_test_result("unexpected_error"), None
         finally:
             authorization = None
             headers = None
@@ -270,7 +472,71 @@ class ProxmoxClient:
         try:
             payload = json.loads(raw)
         except (TypeError, ValueError):
-            return connection_test_result("invalid_response")
+            return connection_test_result("invalid_response"), None
+        finally:
+            raw = None
         if not isinstance(payload, dict) or "data" not in payload:
-            return connection_test_result("invalid_response")
-        return connection_test_result("success")
+            return connection_test_result("invalid_response"), None
+        return connection_test_result("success"), payload["data"]
+
+    def test_connection(
+        self,
+        configuration: ProxmoxConfiguration,
+        secret: str,
+    ) -> ConnectionTestResult:
+        """Authenticate with one read-only request and validate its JSON shape."""
+        result, _data = self._get_json(configuration, secret, API_PATH)
+        return result
+
+    def get_inventory(
+        self,
+        configuration: ProxmoxConfiguration,
+        secret: str,
+    ) -> InventoryResult:
+        """Load a normalized cluster inventory with two read-only requests."""
+        try:
+            result, node_data = self._get_json(
+                configuration,
+                secret,
+                CLUSTER_RESOURCES_PATH,
+                _NODE_QUERY,
+            )
+            if not result.success:
+                return _inventory_result(
+                    result.category,
+                    http_status=result.http_status,
+                )
+            nodes = _parse_nodes(node_data)
+
+            result, guest_data = self._get_json(
+                configuration,
+                secret,
+                CLUSTER_RESOURCES_PATH,
+                _GUEST_QUERY,
+            )
+            if not result.success:
+                return _inventory_result(
+                    result.category,
+                    http_status=result.http_status,
+                )
+            guests = _parse_guests(guest_data)
+
+            nodes_by_name = {node.name: node for node in nodes}
+            for guest in guests:
+                nodes_by_name.setdefault(
+                    guest.node,
+                    ProxmoxNode(name=guest.node, status="unknown"),
+                )
+            inventory = ProxmoxInventory(
+                nodes=tuple(
+                    sorted(nodes_by_name.values(), key=lambda node: node.name)
+                ),
+                guests=guests,
+            )
+            return _inventory_result("success", inventory=inventory)
+        except ProxmoxValidationError as exc:
+            return _inventory_result(exc.category)
+        except Exception:
+            return _inventory_result("unexpected_error")
+        finally:
+            secret = ""

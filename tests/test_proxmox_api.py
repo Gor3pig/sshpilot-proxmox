@@ -3,6 +3,7 @@
 import email.message
 import importlib.util
 import io
+import json
 import socket
 import ssl
 import sys
@@ -84,6 +85,22 @@ class _Opener:
         return self.outcome
 
 
+class _SequenceOpener:
+    def __init__(self, *outcomes):
+        self.outcomes = outcomes
+        self.calls = []
+
+    def open(self, request, timeout):
+        index = len(self.calls)
+        self.calls.append((request, timeout))
+        if index >= len(self.outcomes):
+            raise AssertionError("unexpected HTTP request")
+        outcome = self.outcomes[index]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
 def _configuration(server_url="https://pve.example.test:8006/"):
     return api.prepare_configuration(server_url, "automation@pve", "sshpilot")
 
@@ -99,6 +116,10 @@ def _http_error(status, *, location=None, body=b""):
         headers,
         io.BytesIO(body),
     )
+
+
+def _json_response(data):
+    return _Response(body=json.dumps({"data": data}).encode())
 
 
 @pytest.mark.parametrize(
@@ -201,6 +222,68 @@ def test_missing_secret_prevents_request():
 
     assert result.category == "missing_secret"
     assert opener.calls == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "@attacker.example.test/collect",
+        "//attacker.example.test/collect",
+        "https://attacker.example.test/collect",
+        "/api2/json/access/permissions?scope=all",
+        "/api2/json/access/permissions#fragment",
+        "/api2/json/access/\rpermissions",
+        "/api2/json/access/\npermissions",
+        "/api2/json/access/\x00permissions",
+    ],
+)
+def test_get_json_rejects_unsafe_internal_paths_before_authorization(
+    path,
+    monkeypatch,
+):
+    opener = _SequenceOpener()
+    authorization_calls = []
+    original_builder = api.build_authorization_header
+
+    def track_authorization(configuration, secret):
+        authorization_calls.append((configuration, secret))
+        return original_builder(configuration, secret)
+
+    monkeypatch.setattr(api, "build_authorization_header", track_authorization)
+
+    result, data = api.ProxmoxClient(opener=opener)._get_json(
+        _configuration(),
+        "path-secret-sentinel",
+        path,
+    )
+
+    assert result.category == "unexpected_error"
+    assert result.message == "The connection test failed."
+    assert data is None
+    assert opener.calls == []
+    assert authorization_calls == []
+    assert "attacker" not in result.message
+    assert path not in result.message
+
+
+def test_inventory_internal_path_error_is_generic_and_sends_no_request(monkeypatch):
+    opener = _SequenceOpener()
+    monkeypatch.setattr(
+        api,
+        "CLUSTER_RESOURCES_PATH",
+        "@attacker.example.test/collect",
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == "unexpected_error"
+    assert result.message == "The inventory could not be loaded."
+    assert result.inventory is None
+    assert opener.calls == []
+    assert "attacker" not in result.message
 
 
 @pytest.mark.parametrize(
@@ -338,6 +421,32 @@ class _CrossOriginRedirectTransport(urllib.request.BaseHandler):
         return _Response(url=request.full_url)
 
 
+class _SecondInventoryRequestRedirectTransport(urllib.request.BaseHandler):
+    handler_order = 100
+
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    def https_open(self, request):
+        self.calls.append(
+            (request.full_url, request.get_header("Authorization"))
+        )
+        if len(self.calls) == 1:
+            return _Response(
+                body=b'{"data": [{"type": "node", "node": "node-a"}]}',
+                url=request.full_url,
+            )
+        if len(self.calls) == 2:
+            return _Response(
+                status=self.status,
+                body=b"",
+                headers={"Location": "https://attacker.example.test/collect"},
+                url=request.full_url,
+            )
+        return _Response(url=request.full_url)
+
+
 @pytest.mark.parametrize("status", sorted(api.REDIRECT_STATUSES))
 def test_cross_origin_redirect_never_creates_second_authenticated_request(status):
     transport = _CrossOriginRedirectTransport(status)
@@ -452,3 +561,593 @@ def test_client_module_has_no_graphical_imports():
     assert "gi" not in api.__dict__
     assert "Gtk" not in api.__dict__
     assert "Adw" not in api.__dict__
+
+
+def test_inventory_models_are_frozen_dataclasses():
+    for model in (
+        api.ProxmoxNode,
+        api.ProxmoxGuest,
+        api.ProxmoxInventory,
+        api.InventoryResult,
+    ):
+        assert model.__dataclass_params__.frozen is True
+
+
+def test_inventory_uses_exact_requests_headers_timeout_and_order():
+    secret = "inventory-secret-sentinel"
+    node_response = _json_response(
+        [
+            {"type": "node", "node": "node-b", "status": "offline"},
+            {"type": "node", "node": "node-a", "status": "online"},
+        ]
+    )
+    guest_response = _json_response(
+        [
+            {
+                "type": "qemu",
+                "vmid": 100,
+                "name": "example-vm",
+                "node": "node-a",
+                "status": "running",
+                "template": False,
+            }
+        ]
+    )
+    opener = _SequenceOpener(node_response, guest_response)
+
+    result = api.ProxmoxClient(timeout=7.5, opener=opener).get_inventory(
+        _configuration(),
+        secret,
+    )
+
+    assert result.success
+    assert result.message == "Inventory loaded."
+    assert len(opener.calls) == 2
+    assert [request.full_url for request, _timeout in opener.calls] == [
+        "https://pve.example.test:8006/api2/json/cluster/resources?type=node",
+        "https://pve.example.test:8006/api2/json/cluster/resources?type=vm",
+    ]
+    for request, timeout in opener.calls:
+        assert request.get_method() == "GET"
+        assert request.get_header("Authorization") == (
+            "PVEAPIToken=automation@pve!sshpilot=inventory-secret-sentinel"
+        )
+        assert request.get_header("Accept") == "application/json"
+        assert timeout == 7.5
+    assert node_response.read_calls == [api.MAX_RESPONSE_BYTES + 1]
+    assert guest_response.read_calls == [api.MAX_RESPONSE_BYTES + 1]
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("secret", "category"),
+    [("", "missing_secret"), ("secret\nInjected", "invalid_configuration")],
+)
+def test_inventory_rejects_missing_or_invalid_secret_without_request(
+    secret,
+    category,
+):
+    opener = _SequenceOpener()
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        secret,
+    )
+
+    assert result.category == category
+    assert result.inventory is None
+    assert opener.calls == []
+
+
+def test_inventory_normalizes_and_sorts_nodes():
+    opener = _SequenceOpener(
+        _json_response(
+            [
+                {"type": "node", "node": "node-c"},
+                {"type": "node", "node": "node-a", "status": "online"},
+                {"type": "node", "node": "node-b", "status": "offline"},
+                {"type": "node", "node": "node-a", "status": "online"},
+            ]
+        ),
+        _json_response([]),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.inventory == api.ProxmoxInventory(
+        nodes=(
+            api.ProxmoxNode("node-a", "online"),
+            api.ProxmoxNode("node-b", "offline"),
+            api.ProxmoxNode("node-c", "unknown"),
+        ),
+        guests=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "node_data",
+    [
+        {},
+        [{}],
+        [{"type": "qemu", "node": "node-a"}],
+        [{"type": "node"}],
+        [{"type": "node", "node": ""}],
+        [{"type": "node", "node": "   "}],
+        [{"type": "node", "node": " node-a"}],
+        [{"type": "node", "node": "node-a "}],
+        [{"type": "node", "node": " node-a "}],
+        [{"type": "node", "node": "node-a\nspoofed"}],
+        [{"type": "node", "node": "node-a\rspoofed"}],
+        [{"type": "node", "node": "node-a\x00spoofed"}],
+        [{"type": "node", "node": 42}],
+        [
+            {"type": "node", "node": "node-a", "status": "online"},
+            {"type": "node", "node": "node-a", "status": "offline"},
+        ],
+    ],
+)
+def test_inventory_rejects_malformed_or_conflicting_nodes_before_guest_request(
+    node_data,
+):
+    opener = _SequenceOpener(_json_response(node_data))
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == "invalid_response"
+    assert result.inventory is None
+    assert len(opener.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["guest\rspoofed", "guest\nspoofed", "guest\x00spoofed"],
+)
+def test_inventory_replaces_guest_names_with_control_characters(name):
+    opener = _SequenceOpener(
+        _json_response([]),
+        _json_response(
+            [{"type": "qemu", "vmid": 100, "node": "node-a", "name": name}]
+        ),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.inventory.guests[0].name == ""
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["online\rspoofed", "online\nspoofed", "online\x00spoofed"],
+)
+def test_inventory_replaces_statuses_with_control_characters(status):
+    node_result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response(
+                [{"type": "node", "node": "node-a", "status": status}]
+            ),
+            _json_response([]),
+        )
+    ).get_inventory(_configuration(), "secret")
+    guest_result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response([]),
+            _json_response(
+                [
+                    {
+                        "type": "lxc",
+                        "vmid": 100,
+                        "node": "node-a",
+                        "status": status,
+                    }
+                ]
+            ),
+        )
+    ).get_inventory(_configuration(), "secret")
+
+    assert node_result.inventory.nodes[0].status == "unknown"
+    assert guest_result.inventory.guests[0].status == "unknown"
+
+
+def test_inventory_normalizes_and_sorts_qemu_and_lxc_guests():
+    opener = _SequenceOpener(
+        _json_response(
+            [
+                {"type": "node", "node": "node-b", "status": "online"},
+                {"type": "node", "node": "node-a", "status": "online"},
+            ]
+        ),
+        _json_response(
+            [
+                {
+                    "type": "lxc",
+                    "vmid": 201,
+                    "node": "node-b",
+                    "status": "stopped",
+                },
+                {
+                    "type": "qemu",
+                    "vmid": 102,
+                    "name": "example-qemu",
+                    "node": "node-a",
+                    "status": "running",
+                    "template": True,
+                },
+                {
+                    "type": "qemu",
+                    "vmid": 101,
+                    "name": 42,
+                    "node": "node-a",
+                    "status": None,
+                    "template": 0,
+                },
+            ]
+        ),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.inventory.guests == (
+        api.ProxmoxGuest("qemu", 101, "", "node-a", "unknown", False),
+        api.ProxmoxGuest("qemu", 102, "example-qemu", "node-a", "running", True),
+        api.ProxmoxGuest("lxc", 201, "", "node-b", "stopped", False),
+    )
+
+
+@pytest.mark.parametrize(
+    ("template_value", "expected"),
+    [(True, True), (False, False), (1, True), (0, False)],
+)
+def test_inventory_accepts_proxmox_template_representations(
+    template_value,
+    expected,
+):
+    guest = {
+        "type": "qemu",
+        "vmid": 100,
+        "node": "node-a",
+        "template": template_value,
+    }
+    opener = _SequenceOpener(
+        _json_response([]),
+        _json_response([guest]),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.inventory.guests[0].template is expected
+
+
+@pytest.mark.parametrize("template_value", [None, "1", 2, [], {}])
+def test_inventory_rejects_invalid_template_representations(template_value):
+    guest = {
+        "type": "qemu",
+        "vmid": 100,
+        "node": "node-a",
+        "template": template_value,
+    }
+    opener = _SequenceOpener(
+        _json_response([]),
+        _json_response([guest]),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == "invalid_response"
+    assert result.inventory is None
+
+
+@pytest.mark.parametrize("vmid", [True, 99, 1_000_000_000, "100"])
+def test_inventory_rejects_invalid_vmids(vmid):
+    opener = _SequenceOpener(
+        _json_response([]),
+        _json_response([{"type": "qemu", "vmid": vmid, "node": "node-a"}]),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == "invalid_response"
+    assert result.inventory is None
+
+
+@pytest.mark.parametrize(
+    "guest",
+    [
+        {},
+        {"type": "openvz", "vmid": 100, "node": "node-a"},
+        {"type": "qemu", "vmid": 100},
+        {"type": "qemu", "vmid": 100, "node": ""},
+        {"type": "qemu", "vmid": 100, "node": "   "},
+        {"type": "qemu", "vmid": 100, "node": " node-a"},
+        {"type": "qemu", "vmid": 100, "node": "node-a "},
+        {"type": "qemu", "vmid": 100, "node": " node-a "},
+        {"type": "qemu", "vmid": 100, "node": "node-a\nspoofed"},
+        {"type": "qemu", "vmid": 100, "node": "node-a\rspoofed"},
+        {"type": "qemu", "vmid": 100, "node": "node-a\x00spoofed"},
+        {"type": "lxc", "vmid": 100, "node": 42},
+    ],
+)
+def test_inventory_rejects_invalid_guest_type_or_node(guest):
+    opener = _SequenceOpener(
+        _json_response([]),
+        _json_response([guest]),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == "invalid_response"
+    assert result.inventory is None
+
+
+def test_inventory_deduplicates_identical_guests_and_rejects_conflicts():
+    guest = {
+        "type": "qemu",
+        "vmid": 100,
+        "name": "example-vm",
+        "node": "node-a",
+        "status": "running",
+    }
+    identical_result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response([]),
+            _json_response([guest, dict(guest)]),
+        )
+    ).get_inventory(_configuration(), "secret")
+
+    conflicting_result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response([]),
+            _json_response([guest, {**guest, "node": "node-b"}]),
+        )
+    ).get_inventory(_configuration(), "secret")
+
+    assert len(identical_result.inventory.guests) == 1
+    assert conflicting_result.category == "invalid_response"
+    assert conflicting_result.inventory is None
+
+
+def test_inventory_adds_one_unknown_node_for_visible_guests_on_missing_node():
+    opener = _SequenceOpener(
+        _json_response(
+            [{"type": "node", "node": "node-a", "status": "online"}]
+        ),
+        _json_response(
+            [
+                {"type": "qemu", "vmid": 100, "node": "node-z"},
+                {"type": "lxc", "vmid": 101, "node": "node-z"},
+            ]
+        ),
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.inventory.nodes == (
+        api.ProxmoxNode("node-a", "online"),
+        api.ProxmoxNode("node-z", "unknown"),
+    )
+
+
+def test_empty_and_acl_filtered_inventory_responses_are_successful():
+    empty_result = api.ProxmoxClient(
+        opener=_SequenceOpener(_json_response([]), _json_response([]))
+    ).get_inventory(_configuration(), "secret")
+    filtered_result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response([{"type": "node", "node": "node-a"}]),
+            _json_response(
+                [{"type": "lxc", "vmid": 101, "node": "node-a"}]
+            ),
+        )
+    ).get_inventory(_configuration(), "secret")
+
+    assert empty_result.success
+    assert empty_result.inventory == api.ProxmoxInventory((), ())
+    assert filtered_result.success
+    assert [guest.vmid for guest in filtered_result.inventory.guests] == [101]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "category"),
+    [
+        (_http_error(401), "unauthorized"),
+        (_http_error(403), "forbidden"),
+        (_http_error(500), "http_error"),
+        (
+            _http_error(302, location="https://redirected.example.test/collect"),
+            "redirected",
+        ),
+        (ssl.SSLCertVerificationError(1, "certificate detail"), "certificate_error"),
+        (ssl.SSLError(1, "TLS detail"), "tls_error"),
+        (TimeoutError("timeout detail"), "timeout"),
+        (urllib.error.URLError(socket.gaierror(-2, "DNS detail")), "connection_error"),
+        (_Response(body=b"not-json"), "invalid_response"),
+        (_Response(body=b'{"data": {}}'), "invalid_response"),
+        (
+            _Response(
+                body=_SizedPayload(
+                    api.MAX_RESPONSE_BYTES + 1,
+                    "oversized-node-response",
+                )
+            ),
+            "invalid_response",
+        ),
+    ],
+)
+def test_first_inventory_request_errors_stop_before_guest_request(outcome, category):
+    opener = _SequenceOpener(outcome)
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == category
+    assert result.inventory is None
+    assert len(opener.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "category"),
+    [
+        (_http_error(401), "unauthorized"),
+        (_http_error(403), "forbidden"),
+        (_http_error(500), "http_error"),
+        (
+            _http_error(307, location="https://redirected.example.test/collect"),
+            "redirected",
+        ),
+        (ssl.SSLCertVerificationError(1, "certificate detail"), "certificate_error"),
+        (ssl.SSLError(1, "TLS detail"), "tls_error"),
+        (urllib.error.URLError(TimeoutError("timeout detail")), "timeout"),
+        (urllib.error.URLError(OSError("connection detail")), "connection_error"),
+        (_Response(body=b"not-json"), "invalid_response"),
+        (_Response(body=b'{"data": {}}'), "invalid_response"),
+        (
+            _Response(
+                body=_SizedPayload(
+                    api.MAX_RESPONSE_BYTES + 1,
+                    "oversized-guest-response",
+                )
+            ),
+            "invalid_response",
+        ),
+    ],
+)
+def test_second_inventory_request_errors_publish_no_partial_inventory(
+    outcome,
+    category,
+):
+    opener = _SequenceOpener(
+        _json_response([{"type": "node", "node": "node-a"}]),
+        outcome,
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        "secret",
+    )
+
+    assert result.category == category
+    assert result.inventory is None
+    assert len(opener.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "category", "message"),
+    [
+        (401, "unauthorized", "Authentication was rejected by the server."),
+        (403, "forbidden", "The API token is not authorized for this operation."),
+        (418, "http_error", "The server returned HTTP 418."),
+    ],
+)
+def test_inventory_http_results_preserve_safe_status_and_message(
+    status,
+    category,
+    message,
+):
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(_http_error(status, body=b"raw body"))
+    ).get_inventory(_configuration(), "secret")
+
+    assert result.category == category
+    assert result.http_status == status
+    assert result.message == message
+    assert result.inventory is None
+    assert "raw body" not in repr(result)
+
+
+@pytest.mark.parametrize("status", sorted(api.REDIRECT_STATUSES))
+def test_inventory_cross_origin_redirect_never_creates_second_request(status):
+    transport = _CrossOriginRedirectTransport(status)
+    opener = urllib.request.build_opener(api._NoRedirectHandler(), transport)
+    secret = "inventory-redirect-secret-sentinel"
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        secret,
+    )
+
+    assert result.category == "redirected"
+    assert transport.calls == [
+        (
+            "https://pve.example.test:8006/api2/json/cluster/resources?type=node",
+            "PVEAPIToken=automation@pve!sshpilot=inventory-redirect-secret-sentinel",
+        )
+    ]
+    assert "attacker.example.test" not in repr(transport.calls)
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize("status", sorted(api.REDIRECT_STATUSES))
+def test_second_inventory_redirect_never_creates_third_request(status):
+    transport = _SecondInventoryRequestRedirectTransport(status)
+    opener = urllib.request.build_opener(api._NoRedirectHandler(), transport)
+    secret = "second-redirect-secret-sentinel"
+
+    result = api.ProxmoxClient(opener=opener).get_inventory(
+        _configuration(),
+        secret,
+    )
+
+    assert result.category == "redirected"
+    assert [url for url, _authorization in transport.calls] == [
+        "https://pve.example.test:8006/api2/json/cluster/resources?type=node",
+        "https://pve.example.test:8006/api2/json/cluster/resources?type=vm",
+    ]
+    assert all(
+        authorization == (
+            "PVEAPIToken=automation@pve!sshpilot=second-redirect-secret-sentinel"
+        )
+        for _url, authorization in transport.calls
+    )
+    assert "attacker.example.test" not in repr(transport.calls)
+    assert secret not in repr(result)
+
+
+def test_inventory_errors_do_not_expose_secret_body_location_or_exception():
+    secret = "inventory-secret-sentinel"
+    body_marker = "raw-response-body-sentinel"
+    location = "https://redirected.example.test/private-location"
+    raw_result = api.ProxmoxClient(
+        opener=_SequenceOpener(_Response(body=body_marker.encode()))
+    ).get_inventory(_configuration(), secret)
+    redirect_result = api.ProxmoxClient(
+        opener=_SequenceOpener(_http_error(302, location=location))
+    ).get_inventory(_configuration(), secret)
+    exception_result = api.ProxmoxClient(
+        opener=_SequenceOpener(RuntimeError(f"backend exposed {secret}"))
+    ).get_inventory(_configuration(), secret)
+
+    for result in (raw_result, redirect_result, exception_result):
+        rendered = repr(result)
+        assert result.inventory is None
+        assert secret not in rendered
+        assert "Authorization" not in rendered
+        assert body_marker not in rendered
+        assert location not in rendered
