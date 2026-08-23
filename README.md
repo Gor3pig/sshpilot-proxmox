@@ -1,15 +1,17 @@
 # Proxmox VE integration for SSH Pilot
 
 This project is a Proxmox VE integration plugin for SSH Pilot. It is currently
-under development and provides local endpoint configuration, but it does not
-communicate with the Proxmox VE API yet.
+under development and provides local endpoint configuration and an authenticated
+HTTPS connection test.
 
 ## Current status
 
 The plugin stores the server URL, API token user, and token ID in SSH Pilot's
 per-plugin settings. The API token secret is stored separately through SSH
 Pilot's secure secrets backend. Saving this configuration does not connect to or
-validate the Proxmox VE server.
+validate the Proxmox VE server. The separate connection test verifies HTTPS and
+API token authentication using the saved configuration. TLS certificate
+verification is required.
 
 ## Planned direction
 
@@ -21,7 +23,8 @@ The integration is intended to:
 - add guests as SSH Pilot connections;
 - open existing SSH Pilot connections.
 
-These Proxmox VE features are planned and are not implemented yet.
+Inventory browsing and the other Proxmox VE features above are planned and are
+not implemented yet.
 
 ## Development and testing
 

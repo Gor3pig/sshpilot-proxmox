@@ -8,6 +8,23 @@ from typing import Any
 
 from sshpilot.plugins.api import PluginContext, SshPilotPlugin
 
+if __package__:
+    from .proxmox_api import (
+        ConnectionTestResult,
+        ProxmoxClient,
+        ProxmoxValidationError,
+        connection_test_result,
+        prepare_configuration,
+    )
+else:
+    from proxmox_api import (
+        ConnectionTestResult,
+        ProxmoxClient,
+        ProxmoxValidationError,
+        connection_test_result,
+        prepare_configuration,
+    )
+
 CONFIGURATION_KEY = "configuration"
 SECRET_KEY = "api_token_secret"
 CONFIGURATION_FIELDS = ("server_url", "token_user", "token_id")
@@ -106,6 +123,43 @@ def save_configuration(
     )
 
 
+def run_connection_test(
+    settings: Any,
+    secrets: Any,
+    client_factory=None,
+) -> ConnectionTestResult:
+    """Test the saved configuration without retaining or exposing its secret."""
+    try:
+        stored_configuration = settings.get(CONFIGURATION_KEY, {})
+    except Exception:
+        return connection_test_result("unexpected_error")
+
+    configuration = normalize_configuration(stored_configuration)
+    try:
+        prepared = prepare_configuration(
+            configuration["server_url"],
+            configuration["token_user"],
+            configuration["token_id"],
+        )
+    except ProxmoxValidationError as exc:
+        return connection_test_result(exc.category)
+
+    try:
+        secret = secrets.get(SECRET_KEY)
+    except Exception:
+        return connection_test_result("secret_unavailable")
+    if not secret:
+        return connection_test_result("missing_secret")
+
+    try:
+        factory = client_factory if client_factory is not None else ProxmoxClient
+        return factory().test_connection(prepared, secret)
+    except Exception:
+        return connection_test_result("unexpected_error")
+    finally:
+        secret = ""
+
+
 class Plugin(SshPilotPlugin):
     def activate(self, ctx: PluginContext) -> None:
         self.ctx = ctx
@@ -114,8 +168,11 @@ class Plugin(SshPilotPlugin):
         self._token_id_row = None
         self._secret_row = None
         self._save_button = None
+        self._test_button = None
         self._status_label = None
         self._page_token = None
+        self._operation_in_progress = False
+        self._client_factory = ProxmoxClient
         ctx.ui.register_page(
             "proxmox",
             "Proxmox VE",
@@ -131,6 +188,7 @@ class Plugin(SshPilotPlugin):
         from gi.repository import Adw, Gtk
 
         self._page_token = object()
+        self._operation_in_progress = False
         configuration = load_configuration(self.ctx.settings)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -177,11 +235,18 @@ class Plugin(SshPilotPlugin):
         secret_help.set_wrap(True)
         content.append(secret_help)
 
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_halign(Gtk.Align.END)
+
+        self._test_button = Gtk.Button(label="Test connection")
+        self._test_button.connect("clicked", self._on_test_clicked)
+        actions.append(self._test_button)
+
         self._save_button = Gtk.Button(label="Save")
         self._save_button.add_css_class("suggested-action")
-        self._save_button.set_halign(Gtk.Align.END)
         self._save_button.connect("clicked", self._on_save_clicked)
-        content.append(self._save_button)
+        actions.append(self._save_button)
+        content.append(actions)
 
         self._status_label = Gtk.Label(xalign=0)
         self._status_label.set_wrap(True)
@@ -194,6 +259,8 @@ class Plugin(SshPilotPlugin):
         return scroller
 
     def _on_save_clicked(self, _button) -> None:
+        if self._operation_in_progress:
+            return
         configuration = build_configuration(
             self._server_url_row.get_text(),
             self._token_user_row.get_text(),
@@ -201,7 +268,7 @@ class Plugin(SshPilotPlugin):
         )
         new_secret = self._secret_row.get_text()
         page_token = self._page_token
-        self._save_button.set_sensitive(False)
+        self._set_busy(True)
         self._set_status("Saving…", "dim-label")
         threading.Thread(
             target=self._save_worker,
@@ -224,13 +291,48 @@ class Plugin(SshPilotPlugin):
         new_secret = ""
         self.ctx.run_on_ui_thread(self._finish_save, result, page_token)
 
+    def _on_test_clicked(self, _button) -> None:
+        if self._operation_in_progress:
+            return
+        page_token = self._page_token
+        self._set_busy(True)
+        self._set_status("Testing connection…", "dim-label")
+        threading.Thread(
+            target=self._test_worker,
+            args=(page_token,),
+            daemon=True,
+        ).start()
+
+    def _test_worker(self, page_token: object) -> None:
+        result = run_connection_test(
+            self.ctx.settings,
+            self.ctx.secrets,
+            self._client_factory,
+        )
+        self.ctx.run_on_ui_thread(self._finish_test, result, page_token)
+
     def _finish_save(self, result: SaveResult, page_token: object) -> None:
         if page_token is not self._page_token:
             return
         if result.clear_secret:
             self._secret_row.set_text("")
         self._set_status(result.message, "success" if result.success else "error")
-        self._save_button.set_sensitive(True)
+        self._set_busy(False)
+
+    def _finish_test(
+        self,
+        result: ConnectionTestResult,
+        page_token: object,
+    ) -> None:
+        if page_token is not self._page_token:
+            return
+        self._set_status(result.message, "success" if result.success else "error")
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._operation_in_progress = busy
+        self._save_button.set_sensitive(not busy)
+        self._test_button.set_sensitive(not busy)
 
     def _set_status(self, message: str, css_class: str) -> None:
         for current_class in ("dim-label", "success", "error"):

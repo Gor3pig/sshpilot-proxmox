@@ -8,13 +8,20 @@ import sys
 import pytest
 
 HERE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
 MISSING = object()
 USE_STORED_SECRET = object()
 
 
 def _load():
+    module_name = "proxmox_plugin"
+    for name in tuple(sys.modules):
+        if name == module_name or name.startswith(module_name + "."):
+            sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(
-        "proxmox_plugin", os.path.join(HERE, "..", "__init__.py")
+        module_name,
+        os.path.join(ROOT, "__init__.py"),
+        submodule_search_locations=[ROOT],
     )
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -44,6 +51,8 @@ class _Settings:
 
     def get(self, key, default=None):
         self.get_calls.append((key, default))
+        if self.operation_log is not None:
+            self.operation_log.append(("settings.get", key))
         if self.fail_get:
             raise RuntimeError("settings unavailable")
         return default if self.value is MISSING else self.value
@@ -97,12 +106,16 @@ class _Secrets:
 class _Ctx:
     def __init__(self):
         self.pages = []
+        self.ui_thread_calls = []
         self.ui = self
         self.settings = _Settings()
         self.secrets = _Secrets()
 
     def register_page(self, page_id, title, icon, factory):
         self.pages.append((page_id, title, icon, factory))
+
+    def run_on_ui_thread(self, callback, *args):
+        self.ui_thread_calls.append((callback, args))
 
 
 def test_activate_registers_one_proxmox_page_without_importing_gtk():
@@ -123,7 +136,7 @@ def test_manifest_declares_only_required_permissions():
     with open(os.path.join(HERE, "..", "plugin.json"), encoding="utf-8") as manifest:
         data = json.load(manifest)
 
-    assert data["permissions"] == ["ui", "settings", "keyring"]
+    assert data["permissions"] == ["ui", "settings", "keyring", "network"]
 
 
 def test_load_configuration_defaults_when_absent():
@@ -314,6 +327,281 @@ def test_secret_read_failure_reports_partial_save_without_revealing_secret():
     assert result.clear_secret is False
     assert secret not in result.message
     assert secret not in repr(result)
+
+
+class _FakeClient:
+    def __init__(self, result, operation_log=None):
+        self.result = result
+        self.operation_log = operation_log
+        self.calls = []
+
+    def test_connection(self, configuration, secret):
+        self.calls.append((configuration, secret))
+        if self.operation_log is not None:
+            self.operation_log.append(("client.test_connection", configuration.endpoint_url))
+        return self.result
+
+
+def test_connection_uses_saved_settings_then_secret_in_worker_logic():
+    mod = _load()
+    operation_log = []
+    stored = {
+        "server_url": "https://pve.example.test:8006/",
+        "token_user": "automation@pve",
+        "token_id": "sshpilot",
+    }
+    settings = _Settings(stored, operation_log=operation_log)
+    secrets = _Secrets(readback="stored-secret", operation_log=operation_log)
+    expected = mod.connection_test_result("success")
+    client = _FakeClient(expected, operation_log)
+
+    result = mod.run_connection_test(settings, secrets, lambda: client)
+
+    assert result is expected
+    assert settings.get_calls == [("configuration", {})]
+    assert secrets.calls == [("get", "api_token_secret")]
+    assert len(client.calls) == 1
+    configuration, secret = client.calls[0]
+    assert configuration.server_url == "https://pve.example.test:8006"
+    assert configuration.token_user == "automation@pve"
+    assert configuration.token_id == "sshpilot"
+    assert secret == "stored-secret"
+    assert operation_log == [
+        ("settings.get", "configuration"),
+        ("secrets.get", "api_token_secret"),
+        (
+            "client.test_connection",
+            "https://pve.example.test:8006/api2/json/access/permissions",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {},
+        {"server_url": "https://pve.test", "token_user": "", "token_id": "id"},
+        {"server_url": "http://pve.test", "token_user": "user", "token_id": "id"},
+    ],
+)
+def test_connection_does_not_read_secret_or_create_client_for_invalid_config(stored):
+    mod = _load()
+    settings = _Settings(stored)
+    secrets = _Secrets(readback="stored-secret")
+
+    def forbidden_factory():
+        raise AssertionError("client created for invalid configuration")
+
+    result = mod.run_connection_test(settings, secrets, forbidden_factory)
+
+    assert result.category in {"invalid_configuration", "invalid_url"}
+    assert secrets.calls == []
+
+
+def test_connection_does_not_create_client_when_secret_is_missing():
+    mod = _load()
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    secrets = _Secrets(readback=None)
+
+    def forbidden_factory():
+        raise AssertionError("client created without a secret")
+
+    result = mod.run_connection_test(settings, secrets, forbidden_factory)
+
+    assert result.category == "missing_secret"
+    assert secrets.calls == [("get", "api_token_secret")]
+
+
+def test_connection_reports_secret_backend_failure_without_creating_client():
+    mod = _load()
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    secrets = _Secrets(fail_get=True)
+
+    def forbidden_factory():
+        raise AssertionError("client created after secret backend failure")
+
+    result = mod.run_connection_test(settings, secrets, forbidden_factory)
+
+    assert result.category == "secret_unavailable"
+    assert result.message == (
+        "The API token secret could not be read from secure storage."
+    )
+
+
+def test_connection_hides_secret_from_unexpected_client_failure():
+    mod = _load()
+    secret = "worker-secret-sentinel"
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    secrets = _Secrets(readback=secret)
+
+    class _FailingClient:
+        def test_connection(self, _configuration, supplied_secret):
+            raise RuntimeError(f"client exposed {supplied_secret}")
+
+    result = mod.run_connection_test(settings, secrets, _FailingClient)
+
+    assert result.category == "unexpected_error"
+    assert secret not in result.message
+    assert secret not in repr(result)
+
+
+class _Button:
+    def __init__(self):
+        self.sensitive_calls = []
+
+    def set_sensitive(self, sensitive):
+        self.sensitive_calls.append(sensitive)
+
+
+class _StatusLabel:
+    def __init__(self):
+        self.label = ""
+        self.css_classes = set()
+
+    def remove_css_class(self, css_class):
+        self.css_classes.discard(css_class)
+
+    def set_label(self, label):
+        self.label = label
+
+    def add_css_class(self, css_class):
+        self.css_classes.add(css_class)
+
+
+class _TextRow:
+    def __init__(self, text):
+        self.text = text
+
+    def get_text(self):
+        return self.text
+
+
+class _DeferredThread:
+    created = []
+
+    def __init__(self, *, target, args, daemon):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.started = False
+        self.created.append(self)
+
+    def start(self):
+        self.started = True
+
+
+def _headless_plugin(mod, ctx):
+    plugin = mod.Plugin()
+    plugin.activate(ctx)
+    plugin._page_token = object()
+    plugin._save_button = _Button()
+    plugin._test_button = _Button()
+    plugin._status_label = _StatusLabel()
+    return plugin
+
+
+def test_test_button_starts_worker_and_uses_ui_thread_callback(monkeypatch):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin = _headless_plugin(mod, ctx)
+    expected = mod.connection_test_result("success")
+    client = _FakeClient(expected)
+    plugin._client_factory = lambda: client
+    plugin._server_url_row = _ForbiddenWidget()
+    plugin._token_user_row = _ForbiddenWidget()
+    plugin._token_id_row = _ForbiddenWidget()
+    plugin._secret_row = _ForbiddenWidget()
+    page_token = plugin._page_token
+
+    plugin._on_test_clicked(None)
+
+    assert len(_DeferredThread.created) == 1
+    worker = _DeferredThread.created[0]
+    assert worker.started is True
+    assert worker.target == plugin._test_worker
+    assert worker.args == (page_token,)
+    assert plugin._operation_in_progress is True
+    assert plugin._save_button.sensitive_calls == [False]
+    assert plugin._test_button.sensitive_calls == [False]
+    assert plugin._status_label.label == "Testing connection…"
+    assert ctx.settings.get_calls == []
+
+    worker.target(*worker.args)
+
+    assert len(ctx.ui_thread_calls) == 1
+    callback, args = ctx.ui_thread_calls[0]
+    assert callback == plugin._finish_test
+    assert args == (expected, page_token)
+    assert ctx.settings.get_calls == [("configuration", {})]
+    assert ctx.secrets.calls == [("get", "api_token_secret")]
+
+    callback(*args)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls == [False, True]
+    assert plugin._test_button.sensitive_calls == [False, True]
+    assert plugin._status_label.label == expected.message
+    assert plugin._status_label.css_classes == {"success"}
+
+
+def test_save_and_test_are_mutually_exclusive_on_one_page(monkeypatch):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    plugin = _headless_plugin(mod, _Ctx())
+    plugin._server_url_row = _TextRow("https://pve.test")
+    plugin._token_user_row = _TextRow("user@pve")
+    plugin._token_id_row = _TextRow("id")
+    plugin._secret_row = _TextRow("new-secret")
+
+    plugin._on_save_clicked(None)
+    plugin._on_test_clicked(None)
+
+    assert len(_DeferredThread.created) == 1
+    assert _DeferredThread.created[0].target == plugin._save_worker
+    assert plugin._operation_in_progress is True
+    assert plugin._save_button.sensitive_calls == [False]
+    assert plugin._test_button.sensitive_calls == [False]
+
+
+def test_stale_test_callback_does_not_touch_rebuilt_page_widgets():
+    mod = _load()
+    plugin = mod.Plugin()
+    page_a_token = object()
+    plugin._page_token = object()
+    plugin._save_button = _ForbiddenWidget()
+    plugin._test_button = _ForbiddenWidget()
+    plugin._status_label = _ForbiddenWidget()
+
+    plugin._finish_test(mod.connection_test_result("success"), page_a_token)
 
 
 class _ForbiddenWidget:
