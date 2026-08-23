@@ -5,6 +5,8 @@
   "homepage": "https://github.com/Gor3pig/sshpilot-proxmox",
   "api_version": 1,
   "permissions": [
-    "ui"
+    "ui",
+    "settings",
+    "keyring"
   ]
 }

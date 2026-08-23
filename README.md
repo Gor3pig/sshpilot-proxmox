@@ -1,8 +1,15 @@
 # Proxmox VE integration for SSH Pilot
 
 This project is a Proxmox VE integration plugin for SSH Pilot. It is currently
-under development; the initial version only registers a minimal plugin page and
-does not communicate with the Proxmox VE API yet.
+under development and provides local endpoint configuration, but it does not
+communicate with the Proxmox VE API yet.
+
+## Current status
+
+The plugin stores the server URL, API token user, and token ID in SSH Pilot's
+per-plugin settings. The API token secret is stored separately through SSH
+Pilot's secure secrets backend. Saving this configuration does not connect to or
+validate the Proxmox VE server.
 
 ## Planned direction
 
