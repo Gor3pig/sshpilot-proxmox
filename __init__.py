@@ -671,11 +671,17 @@ class Plugin(SshPilotPlugin):
         page_token = self._page_token
         self._set_busy(True)
         self._set_status("Saving…", "dim-label")
-        threading.Thread(
-            target=self._save_worker,
-            args=(configuration, new_secret, page_token),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._save_worker,
+                args=(configuration, new_secret, page_token),
+                daemon=True,
+            ).start()
+        except Exception:
+            if page_token is not self._page_token:
+                return
+            self._set_status("The save operation could not be started.", "error")
+            self._set_busy(False)
 
     def _save_worker(
         self,
@@ -698,11 +704,20 @@ class Plugin(SshPilotPlugin):
         page_token = self._page_token
         self._set_busy(True)
         self._set_status("Testing connection…", "dim-label")
-        threading.Thread(
-            target=self._test_worker,
-            args=(page_token,),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._test_worker,
+                args=(page_token,),
+                daemon=True,
+            ).start()
+        except Exception:
+            if page_token is not self._page_token:
+                return
+            self._set_status(
+                "The connection test could not be started.",
+                "error",
+            )
+            self._set_busy(False)
 
     def _test_worker(self, page_token: object) -> None:
         result = run_connection_test(
@@ -722,11 +737,21 @@ class Plugin(SshPilotPlugin):
         self._inventory_spinner.set_visible(True)
         self._inventory_spinner.start()
         self._inventory_status_row.set_title("Loading inventory…")
-        threading.Thread(
-            target=self._refresh_worker,
-            args=(page_token,),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._refresh_worker,
+                args=(page_token,),
+                daemon=True,
+            ).start()
+        except Exception:
+            if page_token is not self._page_token:
+                return
+            self._inventory_spinner.stop()
+            self._inventory_spinner.set_visible(False)
+            self._inventory_status_row.set_title(
+                "The inventory refresh could not be started."
+            )
+            self._set_busy(False)
 
     def _refresh_worker(self, page_token: object) -> None:
         result = run_inventory_refresh(

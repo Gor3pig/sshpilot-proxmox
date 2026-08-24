@@ -1280,6 +1280,21 @@ class _DeferredThread:
         self.started = True
 
 
+def _thread_type_failing_at(failure_point):
+    if failure_point == "constructor":
+
+        def fail_constructor(**_kwargs):
+            raise RuntimeError("unexpected thread constructor detail")
+
+        return fail_constructor
+
+    class _StartFailingThread(_DeferredThread):
+        def start(self):
+            raise RuntimeError("unexpected thread start detail")
+
+    return _StartFailingThread
+
+
 def _build_headless_page(mod, ctx, monkeypatch):
     _install_fake_gi(monkeypatch)
     plugin = mod.Plugin()
@@ -1304,6 +1319,165 @@ def _headless_plugin(mod, ctx):
     plugin._custom_ca_enabled = False
     plugin._status_label = _StatusLabel()
     return plugin
+
+
+@pytest.mark.parametrize("failure_point", ("constructor", "start"))
+def test_save_thread_startup_failure_restores_ui_without_running_worker(
+    failure_point,
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(
+        mod.threading,
+        "Thread",
+        _thread_type_failing_at(failure_point),
+    )
+    ctx = _Ctx()
+    plugin = _headless_plugin(mod, ctx)
+    plugin._server_url_row = _TextRow("https://pve.test")
+    plugin._token_user_row = _TextRow("user@pve")
+    plugin._token_id_row = _TextRow("id")
+    plugin._secret_row = _TextRow("new-secret")
+
+    plugin._on_save_clicked(None)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls == [False, True]
+    assert plugin._test_button.sensitive_calls == [False, True]
+    assert plugin._refresh_button.sensitive_calls == [False, True]
+    assert plugin._import_custom_ca_button.sensitive_calls == [False, True]
+    assert plugin._remove_custom_ca_button.sensitive_calls == [False, False]
+    assert plugin._status_label.label == "The save operation could not be started."
+    assert plugin._status_label.css_classes == {"error"}
+    assert "unexpected thread" not in plugin._status_label.label
+    assert ctx.settings.set_calls == []
+    assert ctx.secrets.calls == []
+    assert ctx.ui_thread_calls == []
+
+
+@pytest.mark.parametrize("failure_point", ("constructor", "start"))
+def test_connection_thread_startup_failure_restores_ui_without_running_worker(
+    failure_point,
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(
+        mod.threading,
+        "Thread",
+        _thread_type_failing_at(failure_point),
+    )
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin = _headless_plugin(mod, ctx)
+    factory_calls = []
+
+    def forbidden_factory(**kwargs):
+        factory_calls.append(kwargs)
+        raise AssertionError("client created after thread startup failure")
+
+    plugin._client_factory = forbidden_factory
+
+    plugin._on_test_clicked(None)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls == [False, True]
+    assert plugin._test_button.sensitive_calls == [False, True]
+    assert plugin._refresh_button.sensitive_calls == [False, True]
+    assert plugin._import_custom_ca_button.sensitive_calls == [False, True]
+    assert plugin._remove_custom_ca_button.sensitive_calls == [False, False]
+    assert plugin._status_label.label == (
+        "The connection test could not be started."
+    )
+    assert plugin._status_label.css_classes == {"error"}
+    assert "unexpected thread" not in plugin._status_label.label
+    assert ctx.settings.get_calls == []
+    assert ctx.secrets.calls == []
+    assert factory_calls == []
+    assert ctx.ui_thread_calls == []
+
+
+@pytest.mark.parametrize("failure_point", ("constructor", "start"))
+def test_refresh_thread_startup_failure_restores_ui_without_running_worker(
+    failure_point,
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(
+        mod.threading,
+        "Thread",
+        _thread_type_failing_at(failure_point),
+    )
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    ctx.settings.get_calls.clear()
+    factory_calls = []
+
+    def forbidden_factory(**kwargs):
+        factory_calls.append(kwargs)
+        raise AssertionError("client created after thread startup failure")
+
+    plugin._client_factory = forbidden_factory
+
+    plugin._on_refresh_clicked(None)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls == [False, True]
+    assert plugin._test_button.sensitive_calls == [False, True]
+    assert plugin._refresh_button.sensitive_calls == [False, True]
+    assert plugin._import_custom_ca_button.sensitive_calls == [False, True]
+    assert plugin._remove_custom_ca_button.sensitive_calls[-2:] == [False, False]
+    assert plugin._inventory_spinner.active is False
+    assert plugin._inventory_spinner.visible is False
+    assert plugin._inventory_status_row.title == (
+        "The inventory refresh could not be started."
+    )
+    assert ctx.settings.get_calls == []
+    assert ctx.secrets.calls == []
+    assert factory_calls == []
+    assert ctx.ui_thread_calls == []
+
+
+def test_stale_thread_startup_failure_does_not_finish_rebuilt_page_operation(
+    monkeypatch,
+):
+    mod = _load()
+    plugin = _headless_plugin(mod, _Ctx())
+
+    class _StaleStartFailingThread(_DeferredThread):
+        def start(self):
+            plugin._page_token = object()
+            plugin._operation_in_progress = True
+            plugin._save_button = _ForbiddenWidget()
+            plugin._test_button = _ForbiddenWidget()
+            plugin._refresh_button = _ForbiddenWidget()
+            plugin._import_custom_ca_button = _ForbiddenWidget()
+            plugin._remove_custom_ca_button = _ForbiddenWidget()
+            plugin._status_label = _ForbiddenWidget()
+            raise RuntimeError("unexpected stale thread start detail")
+
+    monkeypatch.setattr(mod.threading, "Thread", _StaleStartFailingThread)
+
+    plugin._on_test_clicked(None)
+
+    assert plugin._operation_in_progress is True
 
 
 def test_test_button_starts_worker_and_uses_ui_thread_callback(monkeypatch):
