@@ -7,7 +7,12 @@ import sys
 
 import pytest
 
-from ui_fakes import _AdwPreferencesGroup, _Button, _install_fake_gi
+from ui_fakes import (
+    _AdwActionRow,
+    _AdwPreferencesGroup,
+    _Button,
+    _install_fake_gi,
+)
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -43,11 +48,13 @@ class _Settings:
         fail_get=False,
         fail_set=False,
         operation_log=None,
+        custom_ca_enabled=MISSING,
     ):
         self.value = value
         self.fail_get = fail_get
         self.fail_set = fail_set
         self.operation_log = operation_log
+        self.custom_ca_enabled = custom_ca_enabled
         self.get_calls = []
         self.set_calls = []
 
@@ -57,6 +64,12 @@ class _Settings:
             self.operation_log.append(("settings.get", key))
         if self.fail_get:
             raise RuntimeError("settings unavailable")
+        if key == "custom_ca_enabled":
+            return (
+                default
+                if self.custom_ca_enabled is MISSING
+                else self.custom_ca_enabled
+            )
         return default if self.value is MISSING else self.value
 
     def set(self, key, value):
@@ -65,7 +78,32 @@ class _Settings:
             self.operation_log.append(("settings.set", key))
         if self.fail_set:
             raise RuntimeError("settings unavailable")
-        self.value = value
+        if key == "custom_ca_enabled":
+            self.custom_ca_enabled = value
+        else:
+            self.value = value
+
+
+class _Files:
+    def __init__(self, root=None, *, fail_path=False, fail_read=False):
+        self.root = root
+        self.fail_path = fail_path
+        self.fail_read = fail_read
+        self.path_calls = []
+        self.read_calls = []
+
+    def path(self, relative):
+        self.path_calls.append(relative)
+        if self.fail_path or self.root is None:
+            raise OSError("private storage unavailable")
+        return os.path.join(self.root, relative)
+
+    def read_bytes(self, relative):
+        self.read_calls.append(relative)
+        if self.fail_read:
+            raise OSError("private storage unavailable")
+        with open(self.path(relative), "rb") as stored:
+            return stored.read()
 
 
 class _Secrets:
@@ -112,6 +150,7 @@ class _Ctx:
         self.ui = self
         self.settings = _Settings()
         self.secrets = _Secrets()
+        self.files = _Files()
 
     def register_page(self, page_id, title, icon, factory):
         self.pages.append((page_id, title, icon, factory))
@@ -138,7 +177,375 @@ def test_manifest_declares_only_required_permissions():
     with open(os.path.join(HERE, "..", "plugin.json"), encoding="utf-8") as manifest:
         data = json.load(manifest)
 
-    assert data["permissions"] == ["ui", "settings", "keyring", "network"]
+    assert data["permissions"] == [
+        "ui",
+        "settings",
+        "keyring",
+        "network",
+        "filesystem",
+    ]
+
+
+def test_custom_ca_disabled_uses_system_trust_without_reading_private_files():
+    mod = _load()
+    files = _Files(fail_read=True)
+
+    assert mod.load_custom_ca_pem(_Settings(), files) is None
+    assert files.read_calls == []
+
+
+def test_custom_ca_enabled_accepts_only_missing_or_exact_boolean_values():
+    mod = _load()
+
+    assert mod._custom_ca_enabled(_Settings()) is False
+    assert mod._custom_ca_enabled(_Settings(custom_ca_enabled=False)) is False
+    assert mod._custom_ca_enabled(_Settings(custom_ca_enabled=True)) is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None])
+def test_custom_ca_enabled_rejects_non_boolean_values(value):
+    mod = _load()
+
+    with pytest.raises(mod.ProxmoxValidationError) as raised:
+        mod._custom_ca_enabled(_Settings(custom_ca_enabled=value))
+
+    assert raised.value.category == "custom_ca_error"
+    assert repr(value) not in str(raised.value)
+
+
+def test_custom_ca_enabled_loads_and_validates_private_copy(tmp_path, monkeypatch):
+    mod = _load()
+    stored = b"private-copy-ca"
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(stored)
+    files = _Files(str(tmp_path))
+    seen = []
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: seen.append(value) or value.decode("ascii"),
+    )
+
+    result = mod.load_custom_ca_pem(
+        _Settings(custom_ca_enabled=True),
+        files,
+    )
+
+    assert result == stored.decode("ascii")
+    assert seen == [stored]
+    assert files.read_calls == [mod.CUSTOM_CA_FILE]
+
+
+def test_custom_ca_enabled_fails_closed_when_private_copy_is_missing(tmp_path):
+    mod = _load()
+
+    with pytest.raises(mod.ProxmoxValidationError) as raised:
+        mod.load_custom_ca_pem(
+            _Settings(custom_ca_enabled=True),
+            _Files(str(tmp_path)),
+        )
+
+    assert raised.value.category == "custom_ca_error"
+    assert str(tmp_path) not in str(raised.value)
+
+
+def test_custom_ca_enabled_fails_closed_when_private_copy_is_invalid(tmp_path):
+    mod = _load()
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(b"not a certificate")
+
+    with pytest.raises(mod.ProxmoxValidationError) as raised:
+        mod.load_custom_ca_pem(
+            _Settings(custom_ca_enabled=True),
+            _Files(str(tmp_path)),
+        )
+
+    assert raised.value.category == "custom_ca_error"
+    assert "not a certificate" not in str(raised.value)
+
+
+def test_disabled_custom_ca_ignores_an_orphaned_private_copy(tmp_path):
+    mod = _load()
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(b"orphaned-invalid-data")
+    files = _Files(str(tmp_path))
+
+    assert mod.load_custom_ca_pem(
+        _Settings(custom_ca_enabled=False),
+        files,
+    ) is None
+    assert files.read_calls == []
+
+
+def test_import_custom_ca_copies_validated_data_and_enables_setting(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "selected-source.pem"
+    source.write_bytes(b"selected-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    settings = _Settings(custom_ca_enabled=False)
+    files = _Files(str(private_root))
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+
+    result = mod.import_custom_ca(settings, files, str(source))
+
+    assert result == mod.CustomCAResult(
+        True,
+        True,
+        "Custom CA certificate imported.",
+    )
+    stored = private_root / mod.CUSTOM_CA_FILE
+    assert stored.read_bytes() == b"selected-ca"
+    assert stored.stat().st_mode & 0o777 == 0o600
+    assert settings.set_calls == [(mod.CUSTOM_CA_ENABLED_KEY, True)]
+    assert str(source) not in repr(settings.set_calls)
+    assert sorted(path.name for path in private_root.iterdir()) == [
+        mod.CUSTOM_CA_FILE
+    ]
+
+
+def test_import_replaces_an_active_ca_without_toggling_setting(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "replacement.pem"
+    source.write_bytes(b"replacement-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    (private_root / mod.CUSTOM_CA_FILE).write_bytes(b"previous-ca")
+    settings = _Settings(custom_ca_enabled=True)
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+
+    result = mod.import_custom_ca(
+        settings,
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is True
+    assert result.enabled is True
+    assert settings.set_calls == []
+    assert (private_root / mod.CUSTOM_CA_FILE).read_bytes() == b"replacement-ca"
+
+
+@pytest.mark.parametrize(
+    "data, expected_message",
+    [
+        (b"", "The selected file is not a valid CA certificate bundle."),
+        (b"\xff", "The selected file is not a valid CA certificate bundle."),
+        (
+            b"-----BEGIN PRIVATE KEY-----\nmaterial\n-----END PRIVATE KEY-----\n",
+            "The selected file contains private key material and was not imported.",
+        ),
+        (
+            b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n",
+            "The selected file is not a valid CA certificate bundle.",
+        ),
+    ],
+)
+def test_import_rejects_invalid_ca_content(tmp_path, data, expected_message):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(data)
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    settings = _Settings(custom_ca_enabled=False)
+
+    result = mod.import_custom_ca(
+        settings,
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is False
+    assert result.enabled is False
+    assert result.message == expected_message
+    assert settings.set_calls == []
+    assert list(private_root.iterdir()) == []
+    assert str(source) not in result.message
+
+
+def test_import_rejects_files_larger_than_one_mib(tmp_path):
+    mod = _load()
+    source = tmp_path / "oversized.pem"
+    source.write_bytes(b"x" * (mod.MAX_CUSTOM_CA_BYTES + 1))
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+
+    result = mod.import_custom_ca(
+        _Settings(custom_ca_enabled=False),
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is False
+    assert result.message == "The selected CA certificate file is too large."
+    assert list(private_root.iterdir()) == []
+
+
+def test_import_accepts_a_file_exactly_at_the_one_mib_limit(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "maximum.pem"
+    source.write_bytes(b"x" * mod.MAX_CUSTOM_CA_BYTES)
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    monkeypatch.setattr(mod, "validate_custom_ca_pem", lambda _value: "valid-ca")
+
+    result = mod.import_custom_ca(
+        _Settings(custom_ca_enabled=False),
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is True
+    assert (private_root / mod.CUSTOM_CA_FILE).read_bytes() == b"valid-ca"
+
+
+def test_import_storage_error_is_sanitized(tmp_path, monkeypatch):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(b"selected-ca")
+    monkeypatch.setattr(mod, "validate_custom_ca_pem", lambda value: "valid-ca")
+
+    result = mod.import_custom_ca(
+        _Settings(custom_ca_enabled=False),
+        _Files(fail_path=True),
+        str(source),
+    )
+
+    assert result.success is False
+    assert result.message == "The custom CA certificate could not be saved."
+    assert str(source) not in result.message
+
+
+def test_import_replace_failure_preserves_active_copy_and_removes_temporary(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(b"replacement-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    stored = private_root / mod.CUSTOM_CA_FILE
+    stored.write_bytes(b"previous-ca")
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+    monkeypatch.setattr(
+        mod.os,
+        "replace",
+        lambda _source, _target: (_ for _ in ()).throw(OSError()),
+    )
+
+    result = mod.import_custom_ca(
+        _Settings(custom_ca_enabled=True),
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is False
+    assert result.enabled is True
+    assert stored.read_bytes() == b"previous-ca"
+    assert sorted(path.name for path in private_root.iterdir()) == [
+        mod.CUSTOM_CA_FILE
+    ]
+
+
+def test_import_setting_error_leaves_ca_disabled_and_cleans_copy(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(b"selected-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    settings = _Settings(custom_ca_enabled=False, fail_set=True)
+    monkeypatch.setattr(mod, "validate_custom_ca_pem", lambda value: "valid-ca")
+
+    result = mod.import_custom_ca(
+        settings,
+        _Files(str(private_root)),
+        str(source),
+    )
+
+    assert result.success is False
+    assert result.enabled is False
+    assert settings.custom_ca_enabled is False
+    assert not (private_root / mod.CUSTOM_CA_FILE).exists()
+
+
+def test_remove_custom_ca_disables_then_deletes_private_copy(tmp_path):
+    mod = _load()
+    stored = tmp_path / mod.CUSTOM_CA_FILE
+    stored.write_bytes(b"stored-ca")
+    settings = _Settings(custom_ca_enabled=True)
+
+    result = mod.remove_custom_ca(settings, _Files(str(tmp_path)))
+
+    assert result == mod.CustomCAResult(True, False, "System trust store restored.")
+    assert settings.set_calls == [(mod.CUSTOM_CA_ENABLED_KEY, False)]
+    assert not stored.exists()
+
+
+def test_remove_custom_ca_accepts_an_already_missing_file(tmp_path):
+    mod = _load()
+
+    result = mod.remove_custom_ca(
+        _Settings(custom_ca_enabled=True),
+        _Files(str(tmp_path)),
+    )
+
+    assert result.success is True
+    assert result.enabled is False
+
+
+def test_remove_settings_error_preserves_private_copy(tmp_path):
+    mod = _load()
+    stored = tmp_path / mod.CUSTOM_CA_FILE
+    stored.write_bytes(b"stored-ca")
+
+    result = mod.remove_custom_ca(
+        _Settings(custom_ca_enabled=True, fail_set=True),
+        _Files(str(tmp_path)),
+    )
+
+    assert result.success is False
+    assert result.enabled is None
+    assert stored.read_bytes() == b"stored-ca"
+
+
+def test_remove_cleanup_error_keeps_system_trust_enabled(tmp_path, monkeypatch):
+    mod = _load()
+    stored = tmp_path / mod.CUSTOM_CA_FILE
+    stored.write_bytes(b"stored-ca")
+    settings = _Settings(custom_ca_enabled=True)
+    monkeypatch.setattr(mod.os, "unlink", lambda _path: (_ for _ in ()).throw(OSError()))
+
+    result = mod.remove_custom_ca(settings, _Files(str(tmp_path)))
+
+    assert result.success is False
+    assert result.enabled is False
+    assert settings.custom_ca_enabled is False
+    assert stored.exists()
+    assert result.message == (
+        "System trust was restored, but the stored custom CA could not be removed."
+    )
 
 
 def test_load_configuration_defaults_when_absent():
@@ -230,6 +637,22 @@ def test_save_without_new_secret_only_writes_stripped_configuration():
     assert result.success is True
     assert result.partial is False
     assert result.clear_secret is False
+
+
+def test_save_endpoint_configuration_preserves_custom_ca_state():
+    mod = _load()
+    settings = _Settings(custom_ca_enabled=True)
+    configuration = mod.build_configuration(
+        "https://pve.example.test:8006",
+        "automation@pve",
+        "sshpilot",
+    )
+
+    result = mod.save_configuration(settings, _Secrets(), configuration, "")
+
+    assert result.success is True
+    assert settings.custom_ca_enabled is True
+    assert settings.set_calls == [("configuration", configuration)]
 
 
 def test_save_with_new_secret_stores_and_verifies_it():
@@ -375,7 +798,10 @@ def test_connection_uses_saved_settings_then_secret_in_worker_logic():
     result = mod.run_connection_test(settings, secrets, lambda: client)
 
     assert result is expected
-    assert settings.get_calls == [("configuration", {})]
+    assert settings.get_calls == [
+        ("configuration", {}),
+        ("custom_ca_enabled", False),
+    ]
     assert secrets.calls == [("get", "api_token_secret")]
     assert len(client.calls) == 1
     configuration, secret = client.calls[0]
@@ -385,6 +811,7 @@ def test_connection_uses_saved_settings_then_secret_in_worker_logic():
     assert secret == "stored-secret"
     assert operation_log == [
         ("settings.get", "configuration"),
+        ("settings.get", "custom_ca_enabled"),
         ("secrets.get", "api_token_secret"),
         (
             "client.test_connection",
@@ -499,7 +926,10 @@ def test_inventory_refresh_uses_saved_settings_then_secret():
     result = mod.run_inventory_refresh(settings, secrets, lambda: client)
 
     assert result is expected
-    assert settings.get_calls == [("configuration", {})]
+    assert settings.get_calls == [
+        ("configuration", {}),
+        ("custom_ca_enabled", False),
+    ]
     assert secrets.calls == [("get", "api_token_secret")]
     assert len(client.calls) == 1
     configuration, secret = client.calls[0]
@@ -509,6 +939,7 @@ def test_inventory_refresh_uses_saved_settings_then_secret():
     assert secret == "stored-secret"
     assert operation_log == [
         ("settings.get", "configuration"),
+        ("settings.get", "custom_ca_enabled"),
         ("secrets.get", "api_token_secret"),
         ("client.get_inventory", "https://pve.example.test:8006"),
     ]
@@ -643,6 +1074,175 @@ def test_inventory_refresh_hides_secret_from_unexpected_client_failure():
     assert secret not in repr(result)
 
 
+def test_connection_passes_the_configured_private_ca_to_the_client(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    stored = tmp_path / mod.CUSTOM_CA_FILE
+    stored.write_bytes(b"stored-ca")
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled=True,
+    )
+    expected = mod.connection_test_result("success")
+    client = _FakeClient(expected)
+    factory_calls = []
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return client
+
+    result = mod.run_connection_test(
+        settings,
+        _Secrets(readback="stored-secret"),
+        factory,
+        _Files(str(tmp_path)),
+    )
+
+    assert result is expected
+    assert factory_calls == [{"custom_ca_pem": "stored-ca"}]
+    assert len(client.calls) == 1
+
+
+def test_inventory_passes_the_same_configured_private_ca_to_the_client(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(b"stored-ca")
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled=True,
+    )
+    inventory = mod.ProxmoxInventory(nodes=(), guests=())
+    expected = mod.InventoryResult("success", "Inventory loaded.", inventory)
+    client = _FakeInventoryClient(expected)
+    factory_calls = []
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return client
+
+    result = mod.run_inventory_refresh(
+        settings,
+        _Secrets(readback="stored-secret"),
+        factory,
+        _Files(str(tmp_path)),
+    )
+
+    assert result is expected
+    assert factory_calls == [{"custom_ca_pem": "stored-ca"}]
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["connection", "inventory"])
+@pytest.mark.parametrize("stored_data", [None, b"not a certificate"])
+def test_unusable_configured_ca_stops_before_secret_or_client(
+    tmp_path,
+    operation,
+    stored_data,
+):
+    mod = _load()
+    if stored_data is not None:
+        (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(stored_data)
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled=True,
+    )
+    secrets = _Secrets(readback="stored-secret")
+
+    def forbidden_factory(**_kwargs):
+        raise AssertionError("client created with an unusable configured CA")
+
+    if operation == "connection":
+        result = mod.run_connection_test(
+            settings,
+            secrets,
+            forbidden_factory,
+            _Files(str(tmp_path)),
+        )
+    else:
+        result = mod.run_inventory_refresh(
+            settings,
+            secrets,
+            forbidden_factory,
+            _Files(str(tmp_path)),
+        )
+
+    assert result.category == "custom_ca_error"
+    assert result.message == (
+        "The configured custom CA certificate is unavailable or invalid."
+    )
+    assert secrets.calls == []
+
+
+@pytest.mark.parametrize("operation", ["connection", "inventory"])
+def test_unconfigured_ca_keeps_the_existing_no_argument_client_factory(operation):
+    mod = _load()
+    settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled=False,
+    )
+    factory_calls = []
+
+    if operation == "connection":
+        expected = mod.connection_test_result("success")
+        client = _FakeClient(expected)
+    else:
+        inventory = mod.ProxmoxInventory(nodes=(), guests=())
+        expected = mod.InventoryResult("success", "Inventory loaded.", inventory)
+        client = _FakeInventoryClient(expected)
+
+    def factory():
+        factory_calls.append(())
+        return client
+
+    if operation == "connection":
+        result = mod.run_connection_test(
+            settings,
+            _Secrets(readback="stored-secret"),
+            factory,
+            _Files(),
+        )
+    else:
+        result = mod.run_inventory_refresh(
+            settings,
+            _Secrets(readback="stored-secret"),
+            factory,
+            _Files(),
+        )
+
+    assert result is expected
+    assert factory_calls == [()]
+
+
 class _StatusLabel:
     def __init__(self):
         self.label = ""
@@ -695,6 +1295,13 @@ def _headless_plugin(mod, ctx):
     plugin._save_button = _Button()
     plugin._test_button = _Button()
     plugin._refresh_button = _Button()
+    plugin._import_custom_ca_button = _Button()
+    plugin._remove_custom_ca_button = _Button()
+    plugin._custom_ca_row = _AdwActionRow(
+        title="Custom CA certificate",
+        subtitle="System trust store",
+    )
+    plugin._custom_ca_enabled = False
     plugin._status_label = _StatusLabel()
     return plugin
 
@@ -742,7 +1349,10 @@ def test_test_button_starts_worker_and_uses_ui_thread_callback(monkeypatch):
     callback, args = ctx.ui_thread_calls[0]
     assert callback == plugin._finish_test
     assert args == (expected, page_token)
-    assert ctx.settings.get_calls == [("configuration", {})]
+    assert ctx.settings.get_calls == [
+        ("configuration", {}),
+        ("custom_ca_enabled", False),
+    ]
     assert ctx.secrets.calls == [("get", "api_token_secret")]
 
     callback(*args)
@@ -753,6 +1363,54 @@ def test_test_button_starts_worker_and_uses_ui_thread_callback(monkeypatch):
     assert plugin._refresh_button.sensitive_calls == [False, True]
     assert plugin._status_label.label == expected.message
     assert plugin._status_label.css_classes == {"success"}
+
+
+def test_test_connection_invalid_custom_ca_flag_fails_closed_and_restores_busy(
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled="true",
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin = _headless_plugin(mod, ctx)
+    factory_calls = []
+
+    def forbidden_factory(**kwargs):
+        factory_calls.append(kwargs)
+        raise AssertionError("client created with an invalid custom CA flag")
+
+    plugin._client_factory = forbidden_factory
+
+    plugin._on_test_clicked(None)
+    worker = _DeferredThread.created[0]
+    worker.target(*worker.args)
+
+    callback, args = ctx.ui_thread_calls[0]
+    result, _page_token = args
+    assert result.category == "custom_ca_error"
+    assert result.message == (
+        "The configured custom CA certificate is unavailable or invalid."
+    )
+    assert ctx.secrets.calls == []
+    assert factory_calls == []
+
+    callback(*args)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls == [False, True]
+    assert plugin._test_button.sensitive_calls == [False, True]
+    assert plugin._refresh_button.sensitive_calls == [False, True]
+    assert plugin._status_label.label == result.message
+    assert plugin._status_label.css_classes == {"error"}
 
 
 def test_save_and_test_are_mutually_exclusive_on_one_page(monkeypatch):
@@ -846,6 +1504,250 @@ def test_page_builds_inventory_controls_with_lazy_fake_gtk(monkeypatch):
     assert "gi" not in mod.__dict__
 
 
+def test_page_builds_minimal_tls_custom_ca_controls(monkeypatch):
+    mod = _load()
+    plugin, page = _build_headless_page(mod, _Ctx(), monkeypatch)
+    content = page.child.child
+    tls_group = next(
+        child
+        for child in content.children
+        if isinstance(child, _AdwPreferencesGroup) and child.title == "TLS"
+    )
+
+    assert tls_group.rows == [plugin._custom_ca_row]
+    assert plugin._custom_ca_row.title == "Custom CA certificate"
+    assert plugin._custom_ca_row.subtitle == "System trust store"
+    assert plugin._custom_ca_row.suffixes == [
+        plugin._import_custom_ca_button,
+        plugin._remove_custom_ca_button,
+    ]
+    assert plugin._import_custom_ca_button.label == "Import…"
+    assert plugin._remove_custom_ca_button.label == "Remove"
+    assert plugin._remove_custom_ca_button.sensitive_calls == [False]
+    assert plugin._import_custom_ca_button.connections == [
+        ("clicked", plugin._on_import_custom_ca_clicked)
+    ]
+    assert plugin._remove_custom_ca_button.connections == [
+        ("clicked", plugin._on_remove_custom_ca_clicked)
+    ]
+
+
+def test_page_shows_enabled_custom_ca_without_exposing_source_details(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=True)
+
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+
+    assert plugin._custom_ca_row.subtitle == "Custom CA configured"
+    assert plugin._remove_custom_ca_button.sensitive_calls == [True]
+    assert "path" not in plugin._custom_ca_row.subtitle.lower()
+
+
+def test_custom_ca_import_uses_chooser_callback_and_updates_ui(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(b"selected-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=False)
+    ctx.files = _Files(str(private_root))
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_choose_custom_ca_file",
+        lambda parent, selected, cancelled, error: callbacks.update(
+            parent=parent,
+            selected=selected,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+
+    plugin._on_import_custom_ca_clicked(plugin._import_custom_ca_button)
+
+    assert plugin._operation_in_progress is True
+    assert callbacks["parent"] is None
+    assert plugin._save_button.sensitive_calls[-1] is False
+    assert plugin._test_button.sensitive_calls[-1] is False
+    assert plugin._refresh_button.sensitive_calls[-1] is False
+    assert plugin._remove_custom_ca_button.sensitive_calls[-1] is False
+
+    callbacks["selected"](str(source))
+
+    assert plugin._operation_in_progress is False
+    assert plugin._custom_ca_enabled is True
+    assert plugin._custom_ca_row.subtitle == "Custom CA configured"
+    assert plugin._status_label.label == "Custom CA certificate imported."
+    assert plugin._status_label.css_classes == {"success"}
+    assert (private_root / mod.CUSTOM_CA_FILE).read_bytes() == b"selected-ca"
+    assert ctx.settings.set_calls == [(mod.CUSTOM_CA_ENABLED_KEY, True)]
+    assert str(source) not in repr(ctx.settings.set_calls)
+
+
+def test_custom_ca_import_busy_state_blocks_save_test_refresh_and_remove(
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_choose_custom_ca_file",
+        lambda _parent, selected, cancelled, error: callbacks.update(
+            selected=selected,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=True)
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    plugin._server_url_row = _ForbiddenWidget()
+    plugin._token_user_row = _ForbiddenWidget()
+    plugin._token_id_row = _ForbiddenWidget()
+    plugin._secret_row = _ForbiddenWidget()
+
+    plugin._on_import_custom_ca_clicked(plugin._import_custom_ca_button)
+    plugin._on_save_clicked(None)
+    plugin._on_test_clicked(None)
+    plugin._on_refresh_clicked(None)
+    plugin._on_remove_custom_ca_clicked(None)
+
+    assert plugin._operation_in_progress is True
+    assert _DeferredThread.created == []
+    assert ctx.settings.set_calls == []
+
+
+def test_custom_ca_chooser_cancellation_restores_busy_state_without_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_choose_custom_ca_file",
+        lambda _parent, selected, cancelled, error: callbacks.update(
+            selected=selected,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=False)
+    ctx.files = _Files(str(tmp_path))
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+
+    plugin._on_import_custom_ca_clicked(plugin._import_custom_ca_button)
+    callbacks["cancelled"]()
+
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == ""
+    assert ctx.settings.set_calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_custom_ca_dialog_error_is_sanitized_and_restores_busy_state(
+    monkeypatch,
+):
+    mod = _load()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_choose_custom_ca_file",
+        lambda _parent, selected, cancelled, error: callbacks.update(
+            selected=selected,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    plugin, _page = _build_headless_page(mod, _Ctx(), monkeypatch)
+
+    plugin._on_import_custom_ca_clicked(plugin._import_custom_ca_button)
+    callbacks["error"]()
+
+    assert plugin._operation_in_progress is False
+    assert plugin._custom_ca_enabled is False
+    assert plugin._custom_ca_row.subtitle == "System trust store"
+    assert plugin._status_label.label == (
+        "The custom CA certificate file could not be opened."
+    )
+    assert plugin._status_label.css_classes == {"error"}
+
+
+def test_stale_custom_ca_chooser_callback_does_not_store_or_touch_widgets(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    source = tmp_path / "selected.pem"
+    source.write_bytes(b"selected-ca")
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_choose_custom_ca_file",
+        lambda _parent, selected, cancelled, error: callbacks.update(
+            selected=selected,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=False)
+    ctx.files = _Files(str(private_root))
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+
+    plugin._on_import_custom_ca_clicked(plugin._import_custom_ca_button)
+    plugin._page_token = object()
+    plugin._custom_ca_row = _ForbiddenWidget()
+    plugin._status_label = _ForbiddenWidget()
+    plugin._save_button = _ForbiddenWidget()
+    plugin._test_button = _ForbiddenWidget()
+    plugin._refresh_button = _ForbiddenWidget()
+    plugin._import_custom_ca_button = _ForbiddenWidget()
+    plugin._remove_custom_ca_button = _ForbiddenWidget()
+
+    callbacks["selected"](str(source))
+
+    assert ctx.settings.set_calls == []
+    assert list(private_root.iterdir()) == []
+
+
+def test_remove_custom_ca_updates_ui_and_restores_system_trust(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(b"stored-ca")
+    ctx = _Ctx()
+    ctx.settings = _Settings(custom_ca_enabled=True)
+    ctx.files = _Files(str(tmp_path))
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+
+    plugin._on_remove_custom_ca_clicked(plugin._remove_custom_ca_button)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._custom_ca_enabled is False
+    assert plugin._custom_ca_row.subtitle == "System trust store"
+    assert plugin._remove_custom_ca_button.sensitive_calls[-1] is False
+    assert plugin._status_label.label == "System trust store restored."
+    assert not (tmp_path / mod.CUSTOM_CA_FILE).exists()
+
+
 def test_refresh_uses_worker_saved_values_and_ui_thread_callback(
     monkeypatch,
 ):
@@ -888,7 +1790,10 @@ def test_refresh_uses_worker_saved_values_and_ui_thread_callback(
     assert plugin._inventory_spinner.active is True
     assert plugin._inventory_spinner.visible is True
     assert plugin._inventory_status_row.title == "Loading inventory…"
-    assert ctx.settings.get_calls == [("configuration", {})]
+    assert ctx.settings.get_calls == [
+        ("configuration", {}),
+        ("custom_ca_enabled", False),
+    ]
     assert ctx.secrets.calls == []
 
     worker.target(*worker.args)
@@ -899,7 +1804,9 @@ def test_refresh_uses_worker_saved_values_and_ui_thread_callback(
     assert args == (expected, page_token)
     assert ctx.settings.get_calls == [
         ("configuration", {}),
+        ("custom_ca_enabled", False),
         ("configuration", {}),
+        ("custom_ca_enabled", False),
     ]
     assert ctx.secrets.calls == [("get", "api_token_secret")]
     assert len(client.calls) == 1
@@ -915,6 +1822,55 @@ def test_refresh_uses_worker_saved_values_and_ui_thread_callback(
     assert plugin._save_button.sensitive_calls == [False, True]
     assert plugin._test_button.sensitive_calls == [False, True]
     assert plugin._refresh_button.sensitive_calls == [False, True]
+
+
+def test_refresh_invalid_custom_ca_flag_fails_closed_and_restores_busy(
+    monkeypatch,
+):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        },
+        custom_ca_enabled=1,
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    factory_calls = []
+
+    def forbidden_factory(**kwargs):
+        factory_calls.append(kwargs)
+        raise AssertionError("client created with an invalid custom CA flag")
+
+    plugin._client_factory = forbidden_factory
+
+    plugin._on_refresh_clicked(None)
+    worker = _DeferredThread.created[0]
+    worker.target(*worker.args)
+
+    callback, args = ctx.ui_thread_calls[0]
+    result, _page_token = args
+    assert result.category == "custom_ca_error"
+    assert result.message == (
+        "The configured custom CA certificate is unavailable or invalid."
+    )
+    assert ctx.secrets.calls == []
+    assert factory_calls == []
+
+    callback(*args)
+
+    assert plugin._operation_in_progress is False
+    assert plugin._inventory_spinner.active is False
+    assert plugin._inventory_spinner.visible is False
+    assert plugin._inventory_status_row.title == result.message
+    assert plugin._save_button.sensitive_calls[-1] is True
+    assert plugin._test_button.sensitive_calls[-1] is True
+    assert plugin._refresh_button.sensitive_calls[-1] is True
 
 
 def test_second_refresh_is_blocked_while_first_is_running(monkeypatch):

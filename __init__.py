@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +19,7 @@ if __package__:
         ProxmoxValidationError,
         connection_test_result,
         prepare_configuration,
+        validate_custom_ca_pem,
     )
 else:
     from proxmox_api import (
@@ -27,10 +30,14 @@ else:
         ProxmoxValidationError,
         connection_test_result,
         prepare_configuration,
+        validate_custom_ca_pem,
     )
 
 CONFIGURATION_KEY = "configuration"
 SECRET_KEY = "api_token_secret"
+CUSTOM_CA_ENABLED_KEY = "custom_ca_enabled"
+CUSTOM_CA_FILE = "custom-ca.pem"
+MAX_CUSTOM_CA_BYTES = 1_048_576
 CONFIGURATION_FIELDS = ("server_url", "token_user", "token_id")
 
 _INVENTORY_REFRESH_MESSAGES = {
@@ -42,6 +49,9 @@ _INVENTORY_REFRESH_MESSAGES = {
     "secret_unavailable": (
         "The API token secret could not be read from secure storage."
     ),
+    "custom_ca_error": (
+        "The configured custom CA certificate is unavailable or invalid."
+    ),
     "unexpected_error": "The inventory could not be loaded.",
 }
 
@@ -51,6 +61,13 @@ class SaveResult:
     success: bool
     partial: bool
     clear_secret: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class CustomCAResult:
+    success: bool
+    enabled: bool | None
     message: str
 
 
@@ -139,10 +156,173 @@ def save_configuration(
     )
 
 
+def _custom_ca_enabled(settings: Any) -> bool:
+    try:
+        value = settings.get(CUSTOM_CA_ENABLED_KEY, False)
+    except Exception as exc:
+        raise ProxmoxValidationError("custom_ca_error") from exc
+    if type(value) is not bool:
+        raise ProxmoxValidationError("custom_ca_error")
+    return value
+
+
+def load_custom_ca_pem(settings: Any, files: Any) -> str | None:
+    """Load the configured private copy, failing closed when it is unusable."""
+    if not _custom_ca_enabled(settings):
+        return None
+    try:
+        raw = files.read_bytes(CUSTOM_CA_FILE)
+        if len(raw) > MAX_CUSTOM_CA_BYTES:
+            raise ProxmoxValidationError("custom_ca_error")
+        return validate_custom_ca_pem(raw)
+    except ProxmoxValidationError as exc:
+        raise ProxmoxValidationError("custom_ca_error") from exc
+    except Exception as exc:
+        raise ProxmoxValidationError("custom_ca_error") from exc
+
+
+def _read_custom_ca_source(source_path: str) -> bytes:
+    try:
+        with open(source_path, "rb") as source:
+            data = source.read(MAX_CUSTOM_CA_BYTES + 1)
+    except Exception as exc:
+        raise ProxmoxValidationError("custom_ca_read_error") from exc
+    if len(data) > MAX_CUSTOM_CA_BYTES:
+        raise ProxmoxValidationError("custom_ca_too_large")
+    return data
+
+
+def _write_custom_ca(files: Any, pem: str) -> None:
+    final_path = files.path(CUSTOM_CA_FILE)
+    directory = os.path.dirname(final_path)
+    descriptor = None
+    temporary_path = None
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=directory,
+            prefix=".custom-ca-",
+            suffix=".tmp",
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as temporary:
+            descriptor = None
+            temporary.write(pem.encode("ascii"))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, final_path)
+        temporary_path = None
+    except Exception:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        raise
+
+
+def import_custom_ca(settings: Any, files: Any, source_path: str) -> CustomCAResult:
+    """Validate and persist one selected CA bundle without retaining its path."""
+    try:
+        was_enabled = _custom_ca_enabled(settings)
+    except ProxmoxValidationError:
+        return CustomCAResult(
+            False,
+            None,
+            "The custom CA configuration is unavailable.",
+        )
+
+    try:
+        raw = _read_custom_ca_source(source_path)
+        pem = validate_custom_ca_pem(raw)
+    except ProxmoxValidationError as exc:
+        messages = {
+            "custom_ca_too_large": (
+                "The selected CA certificate file is too large."
+            ),
+            "custom_ca_private_key": (
+                "The selected file contains private key material and was not "
+                "imported."
+            ),
+            "custom_ca_read_error": (
+                "The selected CA certificate file could not be read."
+            ),
+        }
+        return CustomCAResult(
+            False,
+            was_enabled,
+            messages.get(
+                exc.category,
+                "The selected file is not a valid CA certificate bundle.",
+            ),
+        )
+    except Exception:
+        return CustomCAResult(
+            False,
+            was_enabled,
+            "The selected file is not a valid CA certificate bundle.",
+        )
+
+    try:
+        _write_custom_ca(files, pem)
+    except Exception:
+        return CustomCAResult(
+            False,
+            was_enabled,
+            "The custom CA certificate could not be saved.",
+        )
+
+    if not was_enabled:
+        try:
+            settings.set(CUSTOM_CA_ENABLED_KEY, True)
+        except Exception:
+            try:
+                os.unlink(files.path(CUSTOM_CA_FILE))
+            except Exception:
+                pass
+            return CustomCAResult(
+                False,
+                False,
+                "The custom CA certificate could not be enabled.",
+            )
+
+    return CustomCAResult(True, True, "Custom CA certificate imported.")
+
+
+def remove_custom_ca(settings: Any, files: Any) -> CustomCAResult:
+    """Disable the custom CA before removing only its private stored copy."""
+    try:
+        settings.set(CUSTOM_CA_ENABLED_KEY, False)
+    except Exception:
+        return CustomCAResult(
+            False,
+            None,
+            "The custom CA certificate could not be disabled.",
+        )
+
+    try:
+        os.unlink(files.path(CUSTOM_CA_FILE))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return CustomCAResult(
+            False,
+            False,
+            "System trust was restored, but the stored custom CA could not be "
+            "removed.",
+        )
+    return CustomCAResult(True, False, "System trust store restored.")
+
+
 def run_connection_test(
     settings: Any,
     secrets: Any,
     client_factory=None,
+    files=None,
 ) -> ConnectionTestResult:
     """Test the saved configuration without retaining or exposing its secret."""
     try:
@@ -161,6 +341,11 @@ def run_connection_test(
         return connection_test_result(exc.category)
 
     try:
+        custom_ca_pem = load_custom_ca_pem(settings, files)
+    except ProxmoxValidationError as exc:
+        return connection_test_result(exc.category)
+
+    try:
         secret = secrets.get(SECRET_KEY)
     except Exception:
         return connection_test_result("secret_unavailable")
@@ -169,7 +354,12 @@ def run_connection_test(
 
     try:
         factory = client_factory if client_factory is not None else ProxmoxClient
-        return factory().test_connection(prepared, secret)
+        client = (
+            factory(custom_ca_pem=custom_ca_pem)
+            if custom_ca_pem is not None
+            else factory()
+        )
+        return client.test_connection(prepared, secret)
     except Exception:
         return connection_test_result("unexpected_error")
     finally:
@@ -188,6 +378,7 @@ def run_inventory_refresh(
     settings: Any,
     secrets: Any,
     client_factory=None,
+    files=None,
 ) -> InventoryResult:
     """Load inventory from saved configuration without retaining its secret."""
     try:
@@ -206,6 +397,11 @@ def run_inventory_refresh(
         return _inventory_refresh_result(exc.category)
 
     try:
+        custom_ca_pem = load_custom_ca_pem(settings, files)
+    except ProxmoxValidationError as exc:
+        return _inventory_refresh_result(exc.category)
+
+    try:
         secret = secrets.get(SECRET_KEY)
     except Exception:
         return _inventory_refresh_result("secret_unavailable")
@@ -214,7 +410,12 @@ def run_inventory_refresh(
 
     try:
         factory = client_factory if client_factory is not None else ProxmoxClient
-        return factory().get_inventory(prepared, secret)
+        client = (
+            factory(custom_ca_pem=custom_ca_pem)
+            if custom_ca_pem is not None
+            else factory()
+        )
+        return client.get_inventory(prepared, secret)
     except Exception:
         return _inventory_refresh_result("unexpected_error")
     finally:
@@ -240,6 +441,60 @@ def inventory_success_message(inventory: ProxmoxInventory) -> str:
     )
 
 
+def _choose_custom_ca_file(
+    parent: Any,
+    on_selected: Any,
+    on_cancelled: Any,
+    on_error: Any,
+) -> None:
+    """Open the platform file chooser without retaining the selected path."""
+    try:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gio, GLib, Gtk
+
+        dialog = Gtk.FileDialog(title="Import custom CA certificate")
+        ca_filter = Gtk.FileFilter()
+        ca_filter.set_name("Certificate files")
+        for pattern in ("*.pem", "*.crt", "*.cer"):
+            ca_filter.add_pattern(pattern)
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("All files")
+        all_filter.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(ca_filter)
+        filters.append(all_filter)
+        dialog.set_filters(filters)
+
+        def _done(file_dialog, result):
+            try:
+                selected = file_dialog.open_finish(result)
+                source_path = selected.get_path() if selected is not None else None
+                if not source_path:
+                    on_error()
+                    return
+                on_selected(source_path)
+            except GLib.Error as exc:
+                try:
+                    cancelled = exc.matches(
+                        Gio.io_error_quark(),
+                        Gio.IOErrorEnum.CANCELLED,
+                    )
+                except Exception:
+                    cancelled = False
+                if cancelled:
+                    on_cancelled()
+                else:
+                    on_error()
+            except Exception:
+                on_error()
+
+        dialog.open(parent, None, _done)
+    except Exception:
+        on_error()
+
+
 class Plugin(SshPilotPlugin):
     def activate(self, ctx: PluginContext) -> None:
         self.ctx = ctx
@@ -250,6 +505,10 @@ class Plugin(SshPilotPlugin):
         self._save_button = None
         self._test_button = None
         self._refresh_button = None
+        self._custom_ca_row = None
+        self._import_custom_ca_button = None
+        self._remove_custom_ca_button = None
+        self._custom_ca_enabled = False
         self._status_label = None
         self._inventory_status_row = None
         self._inventory_spinner = None
@@ -280,6 +539,10 @@ class Plugin(SshPilotPlugin):
         self._operation_in_progress = False
         self._inventory_groups = []
         configuration = load_configuration(self.ctx.settings)
+        try:
+            self._custom_ca_enabled = _custom_ca_enabled(self.ctx.settings)
+        except ProxmoxValidationError:
+            self._custom_ca_enabled = False
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         for set_margin in (
@@ -324,6 +587,31 @@ class Plugin(SshPilotPlugin):
         secret_help.add_css_class("caption")
         secret_help.set_wrap(True)
         content.append(secret_help)
+
+        tls_group = Adw.PreferencesGroup(title="TLS")
+        self._custom_ca_row = Adw.ActionRow(
+            title="Custom CA certificate",
+            subtitle=(
+                "Custom CA configured"
+                if self._custom_ca_enabled
+                else "System trust store"
+            ),
+        )
+        self._import_custom_ca_button = Gtk.Button(label="Import…")
+        self._import_custom_ca_button.connect(
+            "clicked",
+            self._on_import_custom_ca_clicked,
+        )
+        self._custom_ca_row.add_suffix(self._import_custom_ca_button)
+        self._remove_custom_ca_button = Gtk.Button(label="Remove")
+        self._remove_custom_ca_button.connect(
+            "clicked",
+            self._on_remove_custom_ca_clicked,
+        )
+        self._remove_custom_ca_button.set_sensitive(self._custom_ca_enabled)
+        self._custom_ca_row.add_suffix(self._remove_custom_ca_button)
+        tls_group.add(self._custom_ca_row)
+        content.append(tls_group)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         actions.set_halign(Gtk.Align.END)
@@ -421,6 +709,7 @@ class Plugin(SshPilotPlugin):
             self.ctx.settings,
             self.ctx.secrets,
             self._client_factory,
+            self.ctx.files,
         )
         self.ctx.run_on_ui_thread(self._finish_test, result, page_token)
 
@@ -444,8 +733,79 @@ class Plugin(SshPilotPlugin):
             self.ctx.settings,
             self.ctx.secrets,
             self._client_factory,
+            self.ctx.files,
         )
         self.ctx.run_on_ui_thread(self._finish_refresh, result, page_token)
+
+    def _on_import_custom_ca_clicked(self, button) -> None:
+        if self._operation_in_progress:
+            return
+        page_token = self._page_token
+        self._set_busy(True)
+        parent = None
+        get_root = getattr(button, "get_root", None)
+        if callable(get_root):
+            try:
+                parent = get_root()
+            except Exception:
+                parent = None
+        _choose_custom_ca_file(
+            parent,
+            lambda source_path: self._on_custom_ca_selected(
+                source_path,
+                page_token,
+            ),
+            lambda: self._on_custom_ca_cancelled(page_token),
+            lambda: self._on_custom_ca_dialog_error(page_token),
+        )
+
+    def _on_custom_ca_selected(
+        self,
+        source_path: str,
+        page_token: object,
+    ) -> None:
+        if page_token is not self._page_token:
+            return
+        result = import_custom_ca(self.ctx.settings, self.ctx.files, source_path)
+        self._finish_custom_ca_operation(result, page_token)
+
+    def _on_custom_ca_cancelled(self, page_token: object) -> None:
+        if page_token is not self._page_token:
+            return
+        self._set_busy(False)
+
+    def _on_custom_ca_dialog_error(self, page_token: object) -> None:
+        self._finish_custom_ca_operation(
+            CustomCAResult(
+                False,
+                None,
+                "The custom CA certificate file could not be opened.",
+            ),
+            page_token,
+        )
+
+    def _on_remove_custom_ca_clicked(self, _button) -> None:
+        if self._operation_in_progress or not self._custom_ca_enabled:
+            return
+        page_token = self._page_token
+        self._set_busy(True)
+        result = remove_custom_ca(self.ctx.settings, self.ctx.files)
+        self._finish_custom_ca_operation(result, page_token)
+
+    def _finish_custom_ca_operation(
+        self,
+        result: CustomCAResult,
+        page_token: object,
+    ) -> None:
+        if page_token is not self._page_token:
+            return
+        if result.enabled is not None:
+            self._custom_ca_enabled = result.enabled
+            self._custom_ca_row.set_subtitle(
+                "Custom CA configured" if result.enabled else "System trust store"
+            )
+        self._set_status(result.message, "success" if result.success else "error")
+        self._set_busy(False)
 
     def _finish_save(self, result: SaveResult, page_token: object) -> None:
         if page_token is not self._page_token:
@@ -543,6 +903,10 @@ class Plugin(SshPilotPlugin):
         self._save_button.set_sensitive(not busy)
         self._test_button.set_sensitive(not busy)
         self._refresh_button.set_sensitive(not busy)
+        self._import_custom_ca_button.set_sensitive(not busy)
+        self._remove_custom_ca_button.set_sensitive(
+            not busy and self._custom_ca_enabled
+        )
 
     def _set_status(self, message: str, css_class: str) -> None:
         for current_class in ("dim-label", "success", "error"):

@@ -171,6 +171,9 @@ class _AdwActionRow:
     def set_title(self, title):
         self.title = title
 
+    def set_subtitle(self, subtitle):
+        self.subtitle = subtitle
+
 
 def _install_fake_gi(monkeypatch):
     gtk = types.SimpleNamespace(

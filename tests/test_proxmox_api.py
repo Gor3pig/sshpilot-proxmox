@@ -224,6 +224,169 @@ def test_missing_secret_prevents_request():
     assert opener.calls == []
 
 
+class _FakeSSLContext:
+    def __init__(self, load_error=None):
+        self.check_hostname = True
+        self.verify_mode = ssl.CERT_REQUIRED
+        self.load_error = load_error
+        self.loaded_cadata = []
+
+    def load_verify_locations(self, *, cadata):
+        self.loaded_cadata.append(cadata)
+        if self.load_error is not None:
+            raise self.load_error
+
+
+def test_default_opener_uses_verifying_context_and_refuses_redirects(monkeypatch):
+    context = _FakeSSLContext()
+    captured = {}
+
+    monkeypatch.setattr(api.ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr(
+        api.urllib.request,
+        "HTTPSHandler",
+        lambda *, context: ("https", context),
+    )
+
+    def capture_opener(*handlers):
+        captured["handlers"] = handlers
+        return object()
+
+    monkeypatch.setattr(api.urllib.request, "build_opener", capture_opener)
+
+    api._build_opener()
+
+    redirect_handler, https_handler = captured["handlers"]
+    assert isinstance(redirect_handler, api._NoRedirectHandler)
+    assert https_handler == ("https", context)
+    assert context.loaded_cadata == []
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_custom_ca_is_loaded_into_the_same_verifying_context(monkeypatch):
+    context = _FakeSSLContext()
+    captured = {}
+    pem = "-----BEGIN CERTIFICATE-----\npublic-ca\n-----END CERTIFICATE-----\n"
+
+    monkeypatch.setattr(api.ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr(
+        api.urllib.request,
+        "HTTPSHandler",
+        lambda *, context: ("https", context),
+    )
+    monkeypatch.setattr(
+        api.urllib.request,
+        "build_opener",
+        lambda *handlers: captured.setdefault("handlers", handlers),
+    )
+
+    api.ProxmoxClient(custom_ca_pem=pem)
+
+    assert context.loaded_cadata == [pem]
+    assert captured["handlers"][1] == ("https", context)
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_injected_opener_is_preserved_without_custom_ca():
+    opener = object()
+
+    client = api.ProxmoxClient(opener=opener)
+
+    assert client._opener is opener
+
+
+def test_injected_opener_and_custom_ca_are_rejected_before_pem_validation():
+    with pytest.raises(ValueError) as raised:
+        api.ProxmoxClient(
+            opener=object(),
+            custom_ca_pem="not a certificate",
+        )
+
+    assert str(raised.value) == (
+        "opener and custom_ca_pem are mutually exclusive"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"",
+        b" \n\t",
+        "non-ascii-\N{SNOWMAN}",
+        "not a certificate",
+        "-----BEGIN CERTIFICATE-----\nmissing end",
+    ],
+)
+def test_custom_ca_validation_rejects_empty_non_ascii_or_malformed_input(value):
+    with pytest.raises(api.ProxmoxValidationError) as raised:
+        api.validate_custom_ca_pem(value)
+
+    assert raised.value.category == "invalid_custom_ca"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+    ],
+)
+def test_custom_ca_validation_rejects_private_key_markers_before_openssl(
+    marker,
+    monkeypatch,
+):
+    context = _FakeSSLContext()
+    monkeypatch.setattr(api.ssl, "create_default_context", lambda: context)
+    value = (
+        "-----BEGIN CERTIFICATE-----\npublic-ca\n-----END CERTIFICATE-----\n"
+        f"-----BEGIN {marker}-----\nprivate-material\n-----END {marker}-----\n"
+    )
+
+    with pytest.raises(api.ProxmoxValidationError) as raised:
+        api.validate_custom_ca_pem(value)
+
+    assert raised.value.category == "custom_ca_private_key"
+    assert context.loaded_cadata == []
+
+
+def test_custom_ca_openssl_error_is_classified_without_exposing_details(monkeypatch):
+    context = _FakeSSLContext(ssl.SSLError("OpenSSL detail sentinel"))
+    monkeypatch.setattr(api.ssl, "create_default_context", lambda: context)
+    value = "-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n"
+
+    with pytest.raises(api.ProxmoxValidationError) as raised:
+        api.validate_custom_ca_pem(value)
+
+    assert raised.value.category == "invalid_custom_ca"
+    assert "OpenSSL detail sentinel" not in str(raised.value)
+
+
+def test_invalid_custom_ca_prevents_opener_construction(monkeypatch):
+    context = _FakeSSLContext(ssl.SSLError("invalid CA sentinel"))
+    monkeypatch.setattr(api.ssl, "create_default_context", lambda: context)
+
+    def forbidden_build_opener(*_handlers):
+        raise AssertionError("opener built after invalid custom CA")
+
+    monkeypatch.setattr(api.urllib.request, "build_opener", forbidden_build_opener)
+
+    with pytest.raises(api.ProxmoxValidationError) as raised:
+        api.ProxmoxClient(
+            custom_ca_pem=(
+                "-----BEGIN CERTIFICATE-----\ninvalid\n"
+                "-----END CERTIFICATE-----\n"
+            )
+        )
+
+    assert raised.value.category == "invalid_custom_ca"
+
+
 @pytest.mark.parametrize(
     "path",
     [

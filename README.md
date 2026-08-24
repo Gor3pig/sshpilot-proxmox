@@ -13,6 +13,16 @@ validate the Proxmox VE server. The separate connection test verifies HTTPS and
 API token authentication using the saved configuration. TLS certificate
 verification is required.
 
+An optional custom CA certificate bundle can be imported for private Proxmox
+deployments. The selected bundle is copied into the plugin's private storage and
+added to a TLS context initialized from Python's default trust store; the source
+file does not need to remain accessible after import. Without a custom CA, the
+normal default trust store is used. Certificate and hostname verification always
+remain enabled, and the plugin provides no insecure TLS mode. Under Flatpak, the
+one-time source selection uses the platform file chooser and document portal
+rather than broad host filesystem access. This behavior still requires runtime
+validation on each supported packaging environment, including macOS.
+
 The **Refresh** action loads the Proxmox VE nodes, QEMU virtual machines, and LXC
 containers visible to the configured API token and displays their current
 status. Guest visibility depends on the permissions assigned to the token in
@@ -25,8 +35,8 @@ Future work is intended to:
 - add guests as SSH Pilot connections;
 - open existing SSH Pilot connections.
 
-Guest IP discovery, SSH Pilot import, power actions, automatic refresh, and a
-custom CA interface are not implemented.
+Guest IP discovery, SSH Pilot import, power actions, and automatic refresh are
+not implemented.
 
 ## Development and testing
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import ssl
 import unicodedata
@@ -18,6 +19,12 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
+_CERTIFICATE_BEGIN = "-----BEGIN CERTIFICATE-----"
+_CERTIFICATE_END = "-----END CERTIFICATE-----"
+_PRIVATE_KEY_MARKER = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+)
+
 _NODE_QUERY = (("type", "node"),)
 _GUEST_QUERY = (("type", "vm"),)
 
@@ -31,6 +38,9 @@ _MESSAGES = {
         "The API token secret could not be read from secure storage."
     ),
     "invalid_url": "Enter a valid HTTPS Proxmox VE server URL.",
+    "custom_ca_error": (
+        "The configured custom CA certificate is unavailable or invalid."
+    ),
     "timeout": "The connection attempt timed out.",
     "certificate_error": "The server certificate could not be verified.",
     "tls_error": "A secure TLS connection could not be established.",
@@ -240,6 +250,52 @@ def build_authorization_header(
     )
 
 
+def _normalize_custom_ca_pem(value: Any) -> str:
+    if isinstance(value, bytes):
+        try:
+            pem = value.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ProxmoxValidationError("invalid_custom_ca") from exc
+    elif isinstance(value, str):
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ProxmoxValidationError("invalid_custom_ca") from exc
+        pem = value
+    else:
+        raise ProxmoxValidationError("invalid_custom_ca")
+
+    if not pem.strip():
+        raise ProxmoxValidationError("invalid_custom_ca")
+    if _PRIVATE_KEY_MARKER.search(pem):
+        raise ProxmoxValidationError("custom_ca_private_key")
+    if (
+        _CERTIFICATE_BEGIN not in pem
+        or _CERTIFICATE_END not in pem
+        or pem.count(_CERTIFICATE_BEGIN) != pem.count(_CERTIFICATE_END)
+    ):
+        raise ProxmoxValidationError("invalid_custom_ca")
+    return pem
+
+
+def _load_custom_ca(context: ssl.SSLContext, value: Any) -> str:
+    pem = _normalize_custom_ca_pem(value)
+    try:
+        context.load_verify_locations(cadata=pem)
+    except (OSError, ValueError, ssl.SSLError) as exc:
+        raise ProxmoxValidationError("invalid_custom_ca") from exc
+    return pem
+
+
+def validate_custom_ca_pem(value: Any) -> str:
+    """Return an ASCII CA bundle after structural and OpenSSL validation."""
+    try:
+        context = ssl.create_default_context()
+    except Exception as exc:
+        raise ProxmoxValidationError("invalid_custom_ca") from exc
+    return _load_custom_ca(context, value)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject every redirect before urllib can construct a second request."""
 
@@ -247,8 +303,14 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
-def _build_opener():
-    return urllib.request.build_opener(_NoRedirectHandler())
+def _build_opener(custom_ca_pem: str | None = None):
+    context = ssl.create_default_context()
+    if custom_ca_pem is not None:
+        _load_custom_ca(context, custom_ca_pem)
+    return urllib.request.build_opener(
+        _NoRedirectHandler(),
+        urllib.request.HTTPSHandler(context=context),
+    )
 
 
 def _http_result(status: int) -> ConnectionTestResult:
@@ -408,11 +470,23 @@ def _parse_guests(data: Any) -> tuple[ProxmoxGuest, ...]:
 class ProxmoxClient:
     """Minimal Proxmox client with strict TLS and no redirects."""
 
-    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS, opener=None):
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        opener=None,
+        custom_ca_pem: str | None = None,
+    ):
+        if opener is not None and custom_ca_pem is not None:
+            raise ValueError("opener and custom_ca_pem are mutually exclusive")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self._timeout = timeout
-        self._opener = opener if opener is not None else _build_opener()
+        self._opener = (
+            opener
+            if opener is not None
+            else _build_opener(custom_ca_pem=custom_ca_pem)
+        )
 
     def _get_json(
         self,
