@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import socket
@@ -15,6 +16,10 @@ from typing import Any
 
 API_PATH = "/api2/json/access/permissions"
 CLUSTER_RESOURCES_PATH = "/api2/json/cluster/resources"
+QEMU_GUEST_INTERFACES_PATH = (
+    "/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+)
+LXC_GUEST_INTERFACES_PATH = "/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -27,6 +32,7 @@ _PRIVATE_KEY_MARKER = re.compile(
 
 _NODE_QUERY = (("type", "node"),)
 _GUEST_QUERY = (("type", "vm"),)
+_IPV4_THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 
 _MESSAGES = {
     "success": "Connection and API token authentication succeeded.",
@@ -119,6 +125,23 @@ class InventoryResult:
 
 
 @dataclass(frozen=True)
+class GuestAddressResult:
+    """Normalized, secret-free guest address discovery outcome."""
+
+    category: str
+    addresses: tuple[str, ...] = ()
+    http_status: int | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.category == "success"
+
+    @property
+    def suggested_host(self) -> str | None:
+        return self.addresses[0] if len(self.addresses) == 1 else None
+
+
+@dataclass(frozen=True)
 class ProxmoxConfiguration:
     """Validated non-sensitive values used for one API request."""
 
@@ -166,6 +189,16 @@ def _inventory_result(
             _INVENTORY_MESSAGES["unexpected_error"],
         )
     return InventoryResult(category, message, inventory, http_status)
+
+
+def guest_address_result(
+    category: str,
+    *,
+    addresses: tuple[str, ...] = (),
+    http_status: int | None = None,
+) -> GuestAddressResult:
+    """Build a normalized guest address discovery result."""
+    return GuestAddressResult(category, addresses, http_status)
 
 
 def _contains_control_characters(value: str) -> bool:
@@ -467,6 +500,74 @@ def _parse_guests(data: Any) -> tuple[ProxmoxGuest, ...]:
     )
 
 
+def _parse_guest_addresses(data: Any, guest_type: str) -> tuple[str, ...]:
+    if guest_type == "qemu":
+        if not isinstance(data, dict):
+            raise ProxmoxValidationError("invalid_response")
+        interfaces = data.get("result")
+    elif guest_type == "lxc":
+        interfaces = data
+    else:
+        raise ProxmoxValidationError("invalid_response")
+    if not isinstance(interfaces, list):
+        raise ProxmoxValidationError("invalid_response")
+
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for interface in interfaces:
+        if not isinstance(interface, dict):
+            raise ProxmoxValidationError("invalid_response")
+        entries = interface.get("ip-addresses", [])
+        if not isinstance(entries, list):
+            raise ProxmoxValidationError("invalid_response")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ProxmoxValidationError("invalid_response")
+            value = entry.get("ip-address")
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ProxmoxValidationError("invalid_response")
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise ProxmoxValidationError("invalid_response") from exc
+            if (
+                address.is_loopback
+                or address.is_link_local
+                or address.is_unspecified
+                or address.is_multicast
+                or address.is_reserved
+                or getattr(address, "is_site_local", False)
+                or (
+                    isinstance(address, ipaddress.IPv4Address)
+                    and address in _IPV4_THIS_NETWORK
+                )
+            ):
+                continue
+            addresses.add(address)
+
+    return tuple(
+        str(address)
+        for address in sorted(
+            addresses,
+            key=lambda address: (address.version, int(address)),
+        )
+    )
+
+
+def _guest_interfaces_path(guest: ProxmoxGuest) -> str:
+    if not isinstance(guest, ProxmoxGuest):
+        raise ProxmoxValidationError("invalid_response")
+    node = urllib.parse.quote(guest.node, safe="")
+    if guest.guest_type == "qemu":
+        path = QEMU_GUEST_INTERFACES_PATH
+    elif guest.guest_type == "lxc":
+        path = LXC_GUEST_INTERFACES_PATH
+    else:
+        raise ProxmoxValidationError("invalid_response")
+    return path.format(node=node, vmid=guest.vmid)
+
+
 class ProxmoxClient:
     """Minimal Proxmox client with strict TLS and no redirects."""
 
@@ -612,5 +713,33 @@ class ProxmoxClient:
             return _inventory_result(exc.category)
         except Exception:
             return _inventory_result("unexpected_error")
+        finally:
+            secret = ""
+
+    def get_guest_addresses(
+        self,
+        configuration: ProxmoxConfiguration,
+        secret: str,
+        guest: ProxmoxGuest,
+    ) -> GuestAddressResult:
+        """Discover usable runtime addresses for one explicitly selected guest."""
+        try:
+            if not isinstance(guest, ProxmoxGuest):
+                raise ProxmoxValidationError("invalid_response")
+            if guest.template or guest.status.casefold() != "running":
+                return guest_address_result("success")
+            path = _guest_interfaces_path(guest)
+            result, data = self._get_json(configuration, secret, path)
+            if not result.success:
+                return guest_address_result(
+                    result.category,
+                    http_status=result.http_status,
+                )
+            addresses = _parse_guest_addresses(data, guest.guest_type)
+            return guest_address_result("success", addresses=addresses)
+        except ProxmoxValidationError as exc:
+            return guest_address_result(exc.category)
+        except Exception:
+            return guest_address_result("unexpected_error")
         finally:
             secret = ""

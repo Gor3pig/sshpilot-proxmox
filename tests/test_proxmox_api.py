@@ -1314,3 +1314,252 @@ def test_inventory_errors_do_not_expose_secret_body_location_or_exception():
         assert "Authorization" not in rendered
         assert body_marker not in rendered
         assert location not in rendered
+
+
+def _guest(guest_type="qemu", *, status="running", template=False):
+    return api.ProxmoxGuest(
+        guest_type=guest_type,
+        vmid=101,
+        name="guest",
+        node="node-a",
+        status=status,
+        template=template,
+    )
+
+
+def test_qemu_address_discovery_uses_guest_agent_endpoint_and_suggests_ipv4():
+    secret = "guest-address-secret-sentinel"
+    opener = _SequenceOpener(
+        _json_response(
+            {
+                "result": [
+                    {
+                        "name": "eth0",
+                        "ip-addresses": [
+                            {
+                                "ip-address": "192.0.2.10",
+                                "ip-address-type": "ipv4",
+                                "prefix": 24,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_guest_addresses(
+        _configuration(),
+        secret,
+        _guest(),
+    )
+
+    assert result == api.GuestAddressResult("success", ("192.0.2.10",))
+    assert result.suggested_host == "192.0.2.10"
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.full_url == (
+        "https://pve.example.test:8006/api2/json/nodes/node-a/qemu/101/"
+        "agent/network-get-interfaces"
+    )
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == (
+        "PVEAPIToken=automation@pve!sshpilot=guest-address-secret-sentinel"
+    )
+    assert timeout == api.DEFAULT_TIMEOUT_SECONDS
+    assert secret not in repr(result)
+
+
+def test_lxc_address_discovery_uses_interfaces_endpoint_and_suggests_ipv6():
+    opener = _SequenceOpener(
+        _json_response(
+            [
+                {
+                    "name": "eth0",
+                    "ip-addresses": [
+                        {
+                            "ip-address": "2001:db8::20",
+                            "ip-address-type": "inet6",
+                            "prefix": 64,
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+
+    result = api.ProxmoxClient(opener=opener).get_guest_addresses(
+        _configuration(),
+        "secret",
+        _guest("lxc"),
+    )
+
+    assert result.addresses == ("2001:db8::20",)
+    assert result.suggested_host == "2001:db8::20"
+    assert opener.calls[0][0].full_url == (
+        "https://pve.example.test:8006/api2/json/nodes/node-a/lxc/101/interfaces"
+    )
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "127.0.0.1",
+        "::1",
+        "169.254.10.20",
+        "fe80::20",
+        "0.0.0.0",
+        "::",
+        "224.0.0.1",
+        "ff02::1",
+        "255.255.255.255",
+        "0.0.0.1",
+        "fec0::1",
+    ],
+)
+def test_guest_address_discovery_ignores_non_ssh_targets(address):
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response(
+                {
+                    "result": [
+                        {
+                            "name": "eth0",
+                            "ip-addresses": [{"ip-address": address}],
+                        }
+                    ]
+                }
+            )
+        )
+    ).get_guest_addresses(_configuration(), "secret", _guest())
+
+    assert result == api.GuestAddressResult("success")
+    assert result.suggested_host is None
+
+
+def test_multiple_interfaces_and_addresses_are_deduplicated_without_guessing():
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(
+            _json_response(
+                {
+                    "result": [
+                        {
+                            "name": "eth1",
+                            "ip-addresses": [
+                                {"ip-address": "2001:db8::30"},
+                                {"ip-address": "192.0.2.30"},
+                            ],
+                        },
+                        {
+                            "name": "eth0",
+                            "ip-addresses": [
+                                {"ip-address": "192.0.2.30"},
+                                {"ip-address": "198.51.100.30"},
+                            ],
+                        },
+                    ]
+                }
+            )
+        )
+    ).get_guest_addresses(_configuration(), "secret", _guest())
+
+    assert result.addresses == (
+        "192.0.2.30",
+        "198.51.100.30",
+        "2001:db8::30",
+    )
+    assert result.suggested_host is None
+
+
+@pytest.mark.parametrize(
+    ("guest_type", "data"),
+    [
+        ("qemu", {"result": [{"name": "eth0"}]}),
+        ("lxc", []),
+    ],
+)
+def test_guest_address_discovery_accepts_interfaces_without_addresses(
+    guest_type,
+    data,
+):
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(_json_response(data))
+    ).get_guest_addresses(_configuration(), "secret", _guest(guest_type))
+
+    assert result == api.GuestAddressResult("success")
+
+
+@pytest.mark.parametrize("guest_type", ["qemu", "lxc"])
+@pytest.mark.parametrize("status", ["stopped", "unknown"])
+def test_non_running_guest_skips_address_request(guest_type, status):
+    opener = _SequenceOpener()
+
+    result = api.ProxmoxClient(opener=opener).get_guest_addresses(
+        _configuration(),
+        "secret",
+        _guest(guest_type, status=status),
+    )
+
+    assert result == api.GuestAddressResult("success")
+    assert opener.calls == []
+
+
+def test_template_skips_address_request():
+    opener = _SequenceOpener()
+
+    result = api.ProxmoxClient(opener=opener).get_guest_addresses(
+        _configuration(),
+        "secret",
+        _guest(template=True),
+    )
+
+    assert result == api.GuestAddressResult("success")
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "category"),
+    [
+        (_http_error(403), "forbidden"),
+        (_http_error(500), "http_error"),
+        (urllib.error.URLError(TimeoutError("agent timeout detail")), "timeout"),
+    ],
+)
+@pytest.mark.parametrize("guest_type", ["qemu", "lxc"])
+def test_guest_address_endpoint_failure_is_sanitized_for_manual_fallback(
+    outcome,
+    category,
+    guest_type,
+):
+    secret = "address-error-secret-sentinel"
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(outcome)
+    ).get_guest_addresses(_configuration(), secret, _guest(guest_type))
+
+    assert result.category == category
+    assert result.addresses == ()
+    assert result.suggested_host is None
+    assert secret not in repr(result)
+    assert "detail" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("guest_type", "data"),
+    [
+        ("qemu", []),
+        ("qemu", {"result": {}}),
+        ("lxc", {}),
+        ("lxc", [{"ip-addresses": {}}]),
+        ("lxc", [{"ip-addresses": [{"ip-address": "not-an-ip"}]}]),
+    ],
+)
+def test_malformed_guest_address_response_falls_back_without_candidates(
+    guest_type,
+    data,
+):
+    result = api.ProxmoxClient(
+        opener=_SequenceOpener(_json_response(data))
+    ).get_guest_addresses(_configuration(), "secret", _guest(guest_type))
+
+    assert result.category == "invalid_response"
+    assert result.addresses == ()

@@ -815,6 +815,111 @@ class _FakeInventoryClient:
         return self.result
 
 
+class _FakeGuestAddressClient:
+    def __init__(self, result, operation_log=None):
+        self.result = result
+        self.operation_log = operation_log
+        self.calls = []
+
+    def get_guest_addresses(self, configuration, secret, guest):
+        self.calls.append((configuration, secret, guest))
+        if self.operation_log is not None:
+            self.operation_log.append(
+                ("client.get_guest_addresses", guest.guest_type, guest.vmid)
+            )
+        return self.result
+
+
+def test_guest_address_discovery_uses_saved_configuration_ca_and_secret(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    operation_log = []
+    settings = _Settings(
+        {
+            "server_url": "https://pve.example.test:8006/",
+            "token_user": "automation@pve",
+            "token_id": "sshpilot",
+        },
+        custom_ca_enabled=True,
+        operation_log=operation_log,
+    )
+    secrets = _Secrets(readback="stored-secret", operation_log=operation_log)
+    files = _Files(str(tmp_path))
+    (tmp_path / "custom-ca.pem").write_text("public CA", encoding="ascii")
+    guest = _api(mod).ProxmoxGuest(
+        "qemu", 101, "guest", "node-a", "running", False
+    )
+    expected = _api(mod).GuestAddressResult("success", ("192.0.2.10",))
+    client = _FakeGuestAddressClient(expected, operation_log)
+    factory_calls = []
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii"),
+    )
+    result = mod.run_guest_address_discovery(
+        settings,
+        secrets,
+        guest,
+        factory,
+        files,
+    )
+
+    assert result is expected
+    assert factory_calls == [{"custom_ca_pem": "public CA"}]
+    assert len(client.calls) == 1
+    configuration, secret, supplied_guest = client.calls[0]
+    assert configuration.server_url == "https://pve.example.test:8006"
+    assert secret == "stored-secret"
+    assert supplied_guest is guest
+    assert operation_log == [
+        ("settings.get", "configuration"),
+        ("settings.get", "custom_ca_enabled"),
+        ("secrets.get", "api_token_secret"),
+        ("client.get_guest_addresses", "qemu", 101),
+    ]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {},
+        {"server_url": "http://pve.test", "token_user": "user", "token_id": "id"},
+    ],
+)
+def test_guest_address_discovery_invalid_configuration_uses_manual_fallback(
+    stored,
+):
+    mod = _load()
+    settings = _Settings(stored)
+    secrets = _Secrets(readback="stored-secret")
+    guest = _api(mod).ProxmoxGuest(
+        "qemu", 101, "guest", "node-a", "running", False
+    )
+
+    def forbidden_factory(**_kwargs):
+        raise AssertionError("client created for invalid configuration")
+
+    result = mod.run_guest_address_discovery(
+        settings,
+        secrets,
+        guest,
+        forbidden_factory,
+        _Files(),
+    )
+
+    assert result.category in {"invalid_configuration", "invalid_url"}
+    assert result.suggested_host is None
+    assert secrets.calls == []
+
+
 def test_connection_uses_saved_settings_then_secret_in_worker_logic():
     mod = _load()
     operation_log = []
@@ -2221,6 +2326,48 @@ def test_manual_ssh_host_validation_rejects_non_host_input(value):
         mod.normalize_ssh_host(value)
 
 
+def test_guest_host_prompt_prefills_discovered_address(monkeypatch):
+    mod = _load()
+    adw, _gtk = _install_fake_gi(monkeypatch)
+    captured = {}
+
+    class _MessageDialog:
+        def __init__(self, **kwargs):
+            captured["dialog"] = self
+            captured["kwargs"] = kwargs
+
+        def set_extra_child(self, child):
+            captured["host_row"] = child.children[0]
+
+        def add_response(self, _response, _label):
+            pass
+
+        def set_default_response(self, _response):
+            pass
+
+        def set_close_response(self, _response):
+            pass
+
+        def connect(self, _signal, callback):
+            captured["callback"] = callback
+
+        def present(self):
+            captured["presented"] = True
+
+    adw.MessageDialog = _MessageDialog
+
+    mod._prompt_ssh_host(
+        None,
+        lambda _host: None,
+        lambda: None,
+        lambda: None,
+        "2001:db8::60",
+    )
+
+    assert captured["host_row"].text == "2001:db8::60"
+    assert captured["presented"] is True
+
+
 def test_guest_connection_identity_uses_endpoint_type_and_vmid_not_guest_name():
     mod = _load()
 
@@ -2238,6 +2385,13 @@ def test_guest_connection_identity_uses_endpoint_type_and_vmid_not_guest_name():
 
 
 def _render_importable_guest(mod, ctx, monkeypatch):
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    monkeypatch.setattr(
+        mod,
+        "run_guest_address_discovery",
+        lambda *_args: _api(mod).GuestAddressResult("success"),
+    )
     ctx.settings = _Settings(
         {
             "server_url": "https://pve.test",
@@ -2266,6 +2420,16 @@ def _render_importable_guest(mod, ctx, monkeypatch):
     return plugin, guest, row, row.suffixes[0]
 
 
+def _complete_guest_address_discovery(ctx):
+    assert len(_DeferredThread.created) == 1
+    worker = _DeferredThread.created.pop()
+    assert worker.started is True
+    worker.target(*worker.args)
+    assert len(ctx.ui_thread_calls) == 1
+    callback, args = ctx.ui_thread_calls.pop()
+    callback(*args)
+
+
 def test_guest_import_requires_explicit_action_and_creates_normal_ssh_connection(
     monkeypatch,
 ):
@@ -2275,11 +2439,12 @@ def test_guest_import_requires_explicit_action_and_creates_normal_ssh_connection
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda parent, submitted, cancelled, error: callbacks.update(
+        lambda parent, submitted, cancelled, error, suggested: callbacks.update(
             parent=parent,
             submitted=submitted,
             cancelled=cancelled,
             error=error,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2297,6 +2462,8 @@ def test_guest_import_requires_explicit_action_and_creates_normal_ssh_connection
     assert plugin._operation_in_progress is True
     assert [call for call in ctx.connection_calls if call[0] == "add"] == []
     assert ctx.secrets.calls == []
+    _complete_guest_address_discovery(ctx)
+    assert callbacks["suggested"] == ""
 
     callbacks["submitted"]("  GUEST.EXAMPLE.TEST  ")
 
@@ -2325,6 +2492,180 @@ def test_guest_import_requires_explicit_action_and_creates_normal_ssh_connection
     assert len([call for call in ctx.connection_calls if call[0] == "add"]) == 1
 
 
+def test_guest_import_prefills_one_discovered_address_but_allows_replacement(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, submitted, _cancelled, _error, suggested: callbacks.update(
+            submitted=submitted,
+            suggested=suggested,
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_guest_address_discovery",
+        lambda *_args: _api(mod).GuestAddressResult(
+            "success",
+            ("192.0.2.40",),
+        ),
+    )
+
+    plugin._on_guest_connection_clicked(
+        button,
+        guest,
+        mod.guest_connection_nickname("https://pve.test", "qemu", 100),
+    )
+
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    _complete_guest_address_discovery(ctx)
+    assert callbacks["suggested"] == "192.0.2.40"
+
+    callbacks["submitted"]("replacement.example.test")
+
+    add_call = next(call for call in ctx.connection_calls if call[0] == "add")
+    assert add_call[1]["hostname"] == "replacement.example.test"
+    assert add_call[1]["port"] == 22
+    assert ctx.secrets.calls == []
+
+
+@pytest.mark.parametrize(
+    ("category", "addresses"),
+    [
+        ("success", ()),
+        ("success", ("192.0.2.50", "2001:db8::50")),
+        ("forbidden", ()),
+        ("invalid_response", ()),
+    ],
+)
+def test_guest_import_uses_empty_manual_fallback_without_one_reliable_address(
+    category,
+    addresses,
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, _submitted, cancelled, _error, suggested: callbacks.update(
+            cancelled=cancelled,
+            suggested=suggested,
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_guest_address_discovery",
+        lambda *_args: _api(mod).GuestAddressResult(category, addresses),
+    )
+
+    plugin._on_guest_connection_clicked(
+        button,
+        guest,
+        mod.guest_connection_nickname("https://pve.test", "qemu", 100),
+    )
+    _complete_guest_address_discovery(ctx)
+
+    assert callbacks["suggested"] == ""
+    assert plugin._operation_in_progress is True
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    callbacks["cancelled"]()
+    assert plugin._operation_in_progress is False
+
+
+@pytest.mark.parametrize("failure_point", ("constructor", "start"))
+def test_guest_address_thread_startup_failure_keeps_manual_import_available(
+    failure_point,
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, _submitted, cancelled, _error, suggested: callbacks.update(
+            cancelled=cancelled,
+            suggested=suggested,
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        mod.threading,
+        "Thread",
+        _thread_type_failing_at(failure_point),
+    )
+    ctx.settings.get_calls.clear()
+
+    plugin._on_guest_connection_clicked(
+        button,
+        guest,
+        mod.guest_connection_nickname("https://pve.test", "qemu", 100),
+    )
+
+    assert callbacks["suggested"] == ""
+    assert plugin._operation_in_progress is True
+    assert ctx.settings.get_calls == []
+    assert ctx.secrets.calls == []
+    callbacks["cancelled"]()
+    assert plugin._operation_in_progress is False
+
+
+def test_stale_guest_address_callback_does_not_open_prompt_or_touch_new_page(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+
+    def forbidden_prompt(*_args):
+        raise AssertionError("stale discovery opened host prompt")
+
+    monkeypatch.setattr(mod, "_prompt_ssh_host", forbidden_prompt)
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+    worker = _DeferredThread.created.pop()
+    worker.target(*worker.args)
+    callback, args = ctx.ui_thread_calls.pop()
+    calls_before_callback = list(ctx.connection_calls)
+    plugin._page_token = object()
+    plugin._operation_in_progress = True
+    plugin._save_button = _ForbiddenWidget()
+    plugin._test_button = _ForbiddenWidget()
+    plugin._refresh_button = _ForbiddenWidget()
+    plugin._status_label = _ForbiddenWidget()
+
+    callback(*args)
+
+    assert plugin._operation_in_progress is True
+    assert ctx.connection_calls == calls_before_callback
+    assert ctx.connections == []
+
+
 def test_guest_import_cancellation_restores_shared_busy_state(monkeypatch):
     mod = _load()
     ctx = _Ctx()
@@ -2332,8 +2673,9 @@ def test_guest_import_cancellation_restores_shared_busy_state(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda _parent, _submitted, cancelled, _error: callbacks.update(
-            cancelled=cancelled
+        lambda _parent, _submitted, cancelled, _error, suggested: callbacks.update(
+            cancelled=cancelled,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2352,6 +2694,8 @@ def test_guest_import_cancellation_restores_shared_busy_state(monkeypatch):
     assert plugin._refresh_button.sensitive_calls[-1] is False
     assert plugin._import_custom_ca_button.sensitive_calls[-1] is False
 
+    _complete_guest_address_discovery(ctx)
+    assert callbacks["suggested"] == ""
     callbacks["cancelled"]()
 
     assert plugin._operation_in_progress is False
@@ -2406,8 +2750,9 @@ def test_guest_import_rejects_invalid_manual_host_without_creating_connection(
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda _parent, submitted, _cancelled, _error: callbacks.update(
-            submitted=submitted
+        lambda _parent, submitted, _cancelled, _error, suggested: callbacks.update(
+            submitted=submitted,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2418,6 +2763,7 @@ def test_guest_import_rejects_invalid_manual_host_without_creating_connection(
     nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
 
     plugin._on_guest_connection_clicked(button, guest, nickname)
+    _complete_guest_address_discovery(ctx)
     callbacks["submitted"]("https://guest.test/path")
 
     assert [call for call in ctx.connection_calls if call[0] == "add"] == []
@@ -2513,8 +2859,9 @@ def test_guest_import_rechecks_identity_before_creation_to_avoid_race_duplicate(
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda _parent, submitted, _cancelled, _error: callbacks.update(
-            submitted=submitted
+        lambda _parent, submitted, _cancelled, _error, suggested: callbacks.update(
+            submitted=submitted,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2524,6 +2871,7 @@ def test_guest_import_rechecks_identity_before_creation_to_avoid_race_duplicate(
     )
     nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
     plugin._on_guest_connection_clicked(button, guest, nickname)
+    _complete_guest_address_discovery(ctx)
     ctx.connections.append(
         types.SimpleNamespace(
             nickname=nickname,
@@ -2551,8 +2899,9 @@ def test_guest_connection_creation_error_is_sanitized_and_restores_busy(
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda _parent, submitted, _cancelled, _error: callbacks.update(
-            submitted=submitted
+        lambda _parent, submitted, _cancelled, _error, suggested: callbacks.update(
+            submitted=submitted,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2563,6 +2912,7 @@ def test_guest_connection_creation_error_is_sanitized_and_restores_busy(
     nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
 
     plugin._on_guest_connection_clicked(button, guest, nickname)
+    _complete_guest_address_discovery(ctx)
     callbacks["submitted"]("guest.example.test")
 
     assert plugin._operation_in_progress is False
@@ -2581,8 +2931,9 @@ def test_stale_guest_host_callback_does_not_create_or_open_connection(monkeypatc
     monkeypatch.setattr(
         mod,
         "_prompt_ssh_host",
-        lambda _parent, submitted, _cancelled, _error: callbacks.update(
-            submitted=submitted
+        lambda _parent, submitted, _cancelled, _error, suggested: callbacks.update(
+            submitted=submitted,
+            suggested=suggested,
         ),
     )
     plugin, guest, _row, button = _render_importable_guest(
@@ -2592,6 +2943,7 @@ def test_stale_guest_host_callback_does_not_create_or_open_connection(monkeypatc
     )
     nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
     plugin._on_guest_connection_clicked(button, guest, nickname)
+    _complete_guest_address_discovery(ctx)
     calls_before_callback = list(ctx.connection_calls)
     plugin._page_token = object()
     plugin._save_button = _ForbiddenWidget()

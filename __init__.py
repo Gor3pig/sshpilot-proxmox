@@ -16,11 +16,13 @@ from sshpilot.plugins.api import PluginContext, SshPilotPlugin
 if __package__:
     from .proxmox_api import (
         ConnectionTestResult,
+        GuestAddressResult,
         InventoryResult,
         ProxmoxClient,
         ProxmoxInventory,
         ProxmoxValidationError,
         connection_test_result,
+        guest_address_result,
         normalize_server_url,
         prepare_configuration,
         validate_custom_ca_pem,
@@ -28,11 +30,13 @@ if __package__:
 else:
     from proxmox_api import (
         ConnectionTestResult,
+        GuestAddressResult,
         InventoryResult,
         ProxmoxClient,
         ProxmoxInventory,
         ProxmoxValidationError,
         connection_test_result,
+        guest_address_result,
         normalize_server_url,
         prepare_configuration,
         validate_custom_ca_pem,
@@ -432,6 +436,55 @@ def run_inventory_refresh(
         secret = ""
 
 
+def run_guest_address_discovery(
+    settings: Any,
+    secrets: Any,
+    guest: Any,
+    client_factory=None,
+    files=None,
+) -> GuestAddressResult:
+    """Discover addresses for one guest without retaining its API secret."""
+    try:
+        stored_configuration = settings.get(CONFIGURATION_KEY, {})
+    except Exception:
+        return guest_address_result("unexpected_error")
+
+    configuration = normalize_configuration(stored_configuration)
+    try:
+        prepared = prepare_configuration(
+            configuration["server_url"],
+            configuration["token_user"],
+            configuration["token_id"],
+        )
+    except ProxmoxValidationError as exc:
+        return guest_address_result(exc.category)
+
+    try:
+        custom_ca_pem = load_custom_ca_pem(settings, files)
+    except ProxmoxValidationError as exc:
+        return guest_address_result(exc.category)
+
+    try:
+        secret = secrets.get(SECRET_KEY)
+    except Exception:
+        return guest_address_result("secret_unavailable")
+    if not secret:
+        return guest_address_result("missing_secret")
+
+    try:
+        factory = client_factory if client_factory is not None else ProxmoxClient
+        client = (
+            factory(custom_ca_pem=custom_ca_pem)
+            if custom_ca_pem is not None
+            else factory()
+        )
+        return client.get_guest_addresses(prepared, secret, guest)
+    except Exception:
+        return guest_address_result("unexpected_error")
+    finally:
+        secret = ""
+
+
 def _pluralized_count(count: int, singular: str) -> str:
     suffix = "" if count == 1 else "s"
     return f"{count} {singular}{suffix}"
@@ -523,6 +576,7 @@ def _prompt_ssh_host(
     on_submitted: Any,
     on_cancelled: Any,
     on_error: Any,
+    suggested_host: str = "",
 ) -> None:
     """Prompt for a guest SSH host without retaining it outside the connection."""
     try:
@@ -540,6 +594,7 @@ def _prompt_ssh_host(
         )
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         host_row = Adw.EntryRow(title="SSH host or IP address")
+        host_row.set_text(suggested_host)
         content.append(host_row)
         dialog.set_extra_child(content)
         dialog.add_response("cancel", "Cancel")
@@ -1065,6 +1120,78 @@ class Plugin(SshPilotPlugin):
                 parent = get_root()
             except Exception:
                 parent = None
+        try:
+            threading.Thread(
+                target=self._guest_address_worker,
+                args=(button, guest, nickname, parent, page_token),
+                daemon=True,
+            ).start()
+        except Exception:
+            if page_token is not self._page_token:
+                return
+            self._show_guest_ssh_host_prompt(
+                button,
+                guest,
+                nickname,
+                parent,
+                page_token,
+                "",
+            )
+
+    def _guest_address_worker(
+        self,
+        button: Any,
+        guest: Any,
+        nickname: str,
+        parent: Any,
+        page_token: object,
+    ) -> None:
+        result = run_guest_address_discovery(
+            self.ctx.settings,
+            self.ctx.secrets,
+            guest,
+            self._client_factory,
+            self.ctx.files,
+        )
+        self.ctx.run_on_ui_thread(
+            self._finish_guest_address_discovery,
+            result,
+            button,
+            guest,
+            nickname,
+            parent,
+            page_token,
+        )
+
+    def _finish_guest_address_discovery(
+        self,
+        result: GuestAddressResult,
+        button: Any,
+        guest: Any,
+        nickname: str,
+        parent: Any,
+        page_token: object,
+    ) -> None:
+        if page_token is not self._page_token:
+            return
+        self._show_guest_ssh_host_prompt(
+            button,
+            guest,
+            nickname,
+            parent,
+            page_token,
+            result.suggested_host if result.success else "",
+        )
+
+    def _show_guest_ssh_host_prompt(
+        self,
+        button: Any,
+        guest: Any,
+        nickname: str,
+        parent: Any,
+        page_token: object,
+        suggested_host: str | None,
+    ) -> None:
         _prompt_ssh_host(
             parent,
             lambda host: self._on_guest_ssh_host_submitted(
@@ -1079,6 +1206,7 @@ class Plugin(SshPilotPlugin):
                 "The SSH host prompt could not be opened.",
                 page_token,
             ),
+            suggested_host or "",
         )
 
     def _on_guest_ssh_host_cancelled(self, page_token: object) -> None:

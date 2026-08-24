@@ -27,13 +27,17 @@ The **Refresh** action loads the Proxmox VE nodes, QEMU virtual machines, and LX
 containers visible to the configured API token and displays their current
 status. Non-template guests can be imported as normal SSH Pilot connections by
 entering an SSH hostname or IP address; imported connections can then be opened
-directly from Inventory. Guest visibility depends on the permissions assigned
-to the token in Proxmox VE.
+directly from Inventory. When Import is selected, the plugin makes one
+best-effort runtime address query for that guest. Exactly one usable address is
+prefilled, while unavailable or ambiguous results leave the editable field
+empty for manual entry. QEMU discovery requires a running guest agent, and
+stopped guests retain the manual fallback. Guest visibility and address access
+depend on the permissions assigned to the token in Proxmox VE.
 
 ## Planned direction
 
-Guest IP discovery, multiple Proxmox VE endpoints, power actions, and automatic
-refresh are not implemented.
+Multiple Proxmox VE endpoints, power actions, and automatic refresh are not
+implemented.
 
 ## Development and testing
 
