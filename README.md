@@ -25,18 +25,15 @@ validation on each supported packaging environment, including macOS.
 
 The **Refresh** action loads the Proxmox VE nodes, QEMU virtual machines, and LXC
 containers visible to the configured API token and displays their current
-status. Guest visibility depends on the permissions assigned to the token in
-Proxmox VE.
+status. Non-template guests can be imported as normal SSH Pilot connections by
+entering an SSH hostname or IP address; imported connections can then be opened
+directly from Inventory. Guest visibility depends on the permissions assigned
+to the token in Proxmox VE.
 
 ## Planned direction
 
-Future work is intended to:
-
-- add guests as SSH Pilot connections;
-- open existing SSH Pilot connections.
-
-Guest IP discovery, SSH Pilot import, power actions, and automatic refresh are
-not implemented.
+Guest IP discovery, multiple Proxmox VE endpoints, power actions, and automatic
+refresh are not implemented.
 
 ## Development and testing
 

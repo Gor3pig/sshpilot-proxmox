@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 
 import pytest
 
@@ -151,12 +152,43 @@ class _Ctx:
         self.settings = _Settings()
         self.secrets = _Secrets()
         self.files = _Files()
+        self.connections = []
+        self.connection_calls = []
+        self.fail_list_connections = False
+        self.fail_add_connection = False
+        self.fail_open_connection = False
 
     def register_page(self, page_id, title, icon, factory):
         self.pages.append((page_id, title, icon, factory))
 
     def run_on_ui_thread(self, callback, *args):
         self.ui_thread_calls.append((callback, args))
+
+    def list_connections(self):
+        self.connection_calls.append(("list",))
+        if self.fail_list_connections:
+            raise RuntimeError("connections unavailable")
+        return list(self.connections)
+
+    def add_connection(self, data):
+        self.connection_calls.append(("add", dict(data)))
+        if self.fail_add_connection:
+            raise RuntimeError("connection creation detail")
+        connection = types.SimpleNamespace(
+            nickname=data["nickname"],
+            host=data["hostname"],
+            username=data.get("username", ""),
+            port=data.get("port", 22),
+            protocol=data.get("protocol", "ssh"),
+        )
+        self.connections.append(connection)
+        return connection
+
+    def open_connection(self, nickname):
+        self.connection_calls.append(("open", nickname))
+        if self.fail_open_connection:
+            raise RuntimeError("connection open detail")
+        return any(connection.nickname == nickname for connection in self.connections)
 
 
 def test_activate_registers_one_proxmox_page_without_importing_gtk():
@@ -183,6 +215,7 @@ def test_manifest_declares_only_required_permissions():
         "keyring",
         "network",
         "filesystem",
+        "connections",
     ]
 
 
@@ -2153,6 +2186,423 @@ def test_inventory_renders_nodes_qemu_lxc_template_and_fallback(monkeypatch):
     assert [row.title for row in node_b.rows] == [
         "No guests visible to this API token were returned for this node."
     ]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("guest.example.test", "guest.example.test"),
+        ("  GUEST.EXAMPLE.TEST  ", "guest.example.test"),
+        ("192.0.2.10", "192.0.2.10"),
+        ("[2001:db8::10]", "2001:db8::10"),
+    ],
+)
+def test_manual_ssh_host_validation_accepts_supported_hosts(value, expected):
+    mod = _load()
+
+    assert mod.normalize_ssh_host(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "https://guest.test",
+        "user@guest.test",
+        "guest.test:2222",
+        "bad host",
+        "999",
+    ],
+)
+def test_manual_ssh_host_validation_rejects_non_host_input(value):
+    mod = _load()
+
+    with pytest.raises(ValueError):
+        mod.normalize_ssh_host(value)
+
+
+def test_guest_connection_identity_uses_endpoint_type_and_vmid_not_guest_name():
+    mod = _load()
+
+    qemu = mod.guest_connection_nickname("https://pve.test/", "qemu", 100)
+
+    assert qemu == mod.guest_connection_nickname(
+        "https://PVE.TEST",
+        "qemu",
+        100,
+    )
+    assert qemu != mod.guest_connection_nickname("https://other.test", "qemu", 100)
+    assert qemu != mod.guest_connection_nickname("https://pve.test", "lxc", 100)
+    assert qemu != mod.guest_connection_nickname("https://pve.test", "qemu", 101)
+    assert "pve.test" not in qemu
+
+
+def _render_importable_guest(mod, ctx, monkeypatch):
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    guest = _api(mod).ProxmoxGuest(
+        "qemu",
+        100,
+        "database",
+        "node-a",
+        "running",
+        False,
+    )
+    plugin._finish_refresh(
+        _inventory_result(
+            mod,
+            nodes=[_api(mod).ProxmoxNode("node-a", "online")],
+            guests=[guest],
+        ),
+        plugin._page_token,
+    )
+    row = plugin._inventory_groups[0].rows[0]
+    return plugin, guest, row, row.suffixes[0]
+
+
+def test_guest_import_requires_explicit_action_and_creates_normal_ssh_connection(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda parent, submitted, cancelled, error: callbacks.update(
+            parent=parent,
+            submitted=submitted,
+            cancelled=cancelled,
+            error=error,
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    assert button.label == "Import…"
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert plugin._operation_in_progress is True
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert ctx.secrets.calls == []
+
+    callbacks["submitted"]("  GUEST.EXAMPLE.TEST  ")
+
+    add_calls = [call for call in ctx.connection_calls if call[0] == "add"]
+    assert add_calls == [
+        (
+            "add",
+            {
+                "nickname": nickname,
+                "display_name": "Proxmox: database",
+                "hostname": "guest.example.test",
+                "port": 22,
+                "protocol": "ssh",
+            },
+        )
+    ]
+    assert ctx.secrets.calls == []
+    assert button.label == "Open"
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == "SSH connection imported."
+    assert plugin._status_label.css_classes == {"success"}
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert ("open", nickname) in ctx.connection_calls
+    assert len([call for call in ctx.connection_calls if call[0] == "add"]) == 1
+
+
+def test_guest_import_cancellation_restores_shared_busy_state(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, _submitted, cancelled, _error: callbacks.update(
+            cancelled=cancelled
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert plugin._operation_in_progress is True
+    assert button.sensitive_calls[-1] is False
+    assert plugin._save_button.sensitive_calls[-1] is False
+    assert plugin._test_button.sensitive_calls[-1] is False
+    assert plugin._refresh_button.sensitive_calls[-1] is False
+    assert plugin._import_custom_ca_button.sensitive_calls[-1] is False
+
+    callbacks["cancelled"]()
+
+    assert plugin._operation_in_progress is False
+    assert button.sensitive_calls[-1] is True
+    assert plugin._save_button.sensitive_calls[-1] is True
+    assert plugin._test_button.sensitive_calls[-1] is True
+    assert plugin._refresh_button.sensitive_calls[-1] is True
+    assert plugin._import_custom_ca_button.sensitive_calls[-1] is True
+
+
+def test_template_guest_has_no_ssh_import_action(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    plugin._finish_refresh(
+        _inventory_result(
+            mod,
+            nodes=[_api(mod).ProxmoxNode("node-a", "online")],
+            guests=[
+                _api(mod).ProxmoxGuest(
+                    "qemu",
+                    100,
+                    "template",
+                    "node-a",
+                    "stopped",
+                    True,
+                )
+            ],
+        ),
+        plugin._page_token,
+    )
+
+    assert [
+        suffix.label for suffix in plugin._inventory_groups[0].rows[0].suffixes
+    ] == ["Template"]
+    assert plugin._guest_connection_buttons == []
+
+
+def test_guest_import_rejects_invalid_manual_host_without_creating_connection(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, submitted, _cancelled, _error: callbacks.update(
+            submitted=submitted
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+    callbacks["submitted"]("https://guest.test/path")
+
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert ctx.secrets.calls == []
+    assert button.label == "Import…"
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == "Enter a valid SSH host or IP address."
+    assert "https://guest.test/path" not in plugin._status_label.label
+
+
+def test_existing_guest_connection_is_opened_without_duplicate(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+    ctx.connections = [
+        types.SimpleNamespace(
+            nickname=nickname,
+            host="guest.example.test",
+            username="",
+            port=22,
+            protocol="ssh",
+        )
+    ]
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+
+    assert button.label == "Open"
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert ("open", nickname) in ctx.connection_calls
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == "SSH connection opened."
+
+
+def test_guest_open_error_is_sanitized_and_restores_busy(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+    ctx.connections = [
+        types.SimpleNamespace(
+            nickname=nickname,
+            host="guest.example.test",
+            username="",
+            port=22,
+            protocol="ssh",
+        )
+    ]
+    ctx.fail_open_connection = True
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == "The SSH connection could not be opened."
+    assert "open detail" not in plugin._status_label.label
+
+
+def test_unavailable_connection_list_blocks_guest_import_fail_closed(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    ctx.fail_list_connections = True
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert [call for call in ctx.connection_calls if call[0] == "open"] == []
+    assert plugin._operation_in_progress is False
+    assert plugin._status_label.label == "SSH Pilot connections are unavailable."
+
+
+def test_guest_import_rechecks_identity_before_creation_to_avoid_race_duplicate(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, submitted, _cancelled, _error: callbacks.update(
+            submitted=submitted
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+    ctx.connections.append(
+        types.SimpleNamespace(
+            nickname=nickname,
+            host="guest.example.test",
+            username="",
+            port=22,
+            protocol="ssh",
+        )
+    )
+
+    callbacks["submitted"]("guest.example.test")
+
+    assert [call for call in ctx.connection_calls if call[0] == "add"] == []
+    assert ("open", nickname) in ctx.connection_calls
+    assert button.label == "Open"
+
+
+def test_guest_connection_creation_error_is_sanitized_and_restores_busy(
+    monkeypatch,
+):
+    mod = _load()
+    ctx = _Ctx()
+    ctx.fail_add_connection = True
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, submitted, _cancelled, _error: callbacks.update(
+            submitted=submitted
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+    callbacks["submitted"]("guest.example.test")
+
+    assert plugin._operation_in_progress is False
+    assert button.label == "Import…"
+    assert plugin._status_label.label == (
+        "The SSH connection could not be imported."
+    )
+    assert "creation detail" not in plugin._status_label.label
+    assert ctx.secrets.calls == []
+
+
+def test_stale_guest_host_callback_does_not_create_or_open_connection(monkeypatch):
+    mod = _load()
+    ctx = _Ctx()
+    callbacks = {}
+    monkeypatch.setattr(
+        mod,
+        "_prompt_ssh_host",
+        lambda _parent, submitted, _cancelled, _error: callbacks.update(
+            submitted=submitted
+        ),
+    )
+    plugin, guest, _row, button = _render_importable_guest(
+        mod,
+        ctx,
+        monkeypatch,
+    )
+    nickname = mod.guest_connection_nickname("https://pve.test", "qemu", 100)
+    plugin._on_guest_connection_clicked(button, guest, nickname)
+    calls_before_callback = list(ctx.connection_calls)
+    plugin._page_token = object()
+    plugin._save_button = _ForbiddenWidget()
+    plugin._test_button = _ForbiddenWidget()
+    plugin._refresh_button = _ForbiddenWidget()
+    plugin._status_label = _ForbiddenWidget()
+
+    callbacks["submitted"]("guest.example.test")
+
+    assert ctx.connection_calls == calls_before_callback
+    assert ctx.connections == []
 
 
 @pytest.mark.parametrize(

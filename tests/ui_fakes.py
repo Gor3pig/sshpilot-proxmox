@@ -79,6 +79,12 @@ class _GtkButton(_Button):
     def connect(self, signal, callback):
         self.connections.append((signal, callback))
 
+    def set_label(self, label):
+        self.label = label
+
+    def get_label(self):
+        return self.label
+
 
 class _GtkSpinner:
     def __init__(self):

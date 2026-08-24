@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -18,6 +21,7 @@ if __package__:
         ProxmoxInventory,
         ProxmoxValidationError,
         connection_test_result,
+        normalize_server_url,
         prepare_configuration,
         validate_custom_ca_pem,
     )
@@ -29,6 +33,7 @@ else:
         ProxmoxInventory,
         ProxmoxValidationError,
         connection_test_result,
+        normalize_server_url,
         prepare_configuration,
         validate_custom_ca_pem,
     )
@@ -39,6 +44,11 @@ CUSTOM_CA_ENABLED_KEY = "custom_ca_enabled"
 CUSTOM_CA_FILE = "custom-ca.pem"
 MAX_CUSTOM_CA_BYTES = 1_048_576
 CONFIGURATION_FIELDS = ("server_url", "token_user", "token_id")
+SSH_PORT = 22
+
+_SSH_HOST_LABEL = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
 
 _INVENTORY_REFRESH_MESSAGES = {
     "invalid_configuration": (
@@ -441,6 +451,115 @@ def inventory_success_message(inventory: ProxmoxInventory) -> str:
     )
 
 
+def normalize_ssh_host(value: Any) -> str:
+    """Validate a manually entered SSH hostname or IP address."""
+    if type(value) is not str:
+        raise ValueError("invalid SSH host")
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 253
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in candidate
+        )
+    ):
+        raise ValueError("invalid SSH host")
+
+    address_candidate = candidate
+    if candidate.startswith("[") or candidate.endswith("]"):
+        if not (candidate.startswith("[") and candidate.endswith("]")):
+            raise ValueError("invalid SSH host")
+        address_candidate = candidate[1:-1]
+    try:
+        return str(ipaddress.ip_address(address_candidate))
+    except ValueError:
+        pass
+
+    if re.fullmatch(r"[0-9.]+", candidate):
+        raise ValueError("invalid SSH host")
+    labels = candidate.split(".")
+    if not labels or any(
+        not _SSH_HOST_LABEL.fullmatch(label) for label in labels
+    ):
+        raise ValueError("invalid SSH host")
+    return candidate.lower()
+
+
+def guest_connection_nickname(
+    server_url: str,
+    guest_type: str,
+    vmid: int,
+) -> str:
+    """Build a stable SSH Pilot nickname for one guest on one endpoint."""
+    normalized_url = normalize_server_url(server_url)
+    normalized_type = str(guest_type).lower()
+    if (
+        normalized_type not in ("qemu", "lxc")
+        or type(vmid) is not int
+        or vmid < 0
+    ):
+        raise ValueError("invalid guest identity")
+    endpoint_id = (
+        hashlib.sha256(normalized_url.encode("utf-8")).digest()[:16].hex()
+    )
+    return f"proxmox-{endpoint_id}-{normalized_type}-{vmid}"
+
+
+def _connection_named(connections: Any, nickname: str) -> Any:
+    expected = nickname.casefold()
+    return next(
+        (
+            connection
+            for connection in connections
+            if str(getattr(connection, "nickname", "")).casefold() == expected
+        ),
+        None,
+    )
+
+
+def _prompt_ssh_host(
+    parent: Any,
+    on_submitted: Any,
+    on_cancelled: Any,
+    on_error: Any,
+) -> None:
+    """Prompt for a guest SSH host without retaining it outside the connection."""
+    try:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gtk
+
+        dialog = Adw.MessageDialog(
+            transient_for=parent,
+            modal=True,
+            heading="Import SSH connection",
+            body="Enter the guest's SSH hostname or IP address.",
+        )
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        host_row = Adw.EntryRow(title="SSH host or IP address")
+        content.append(host_row)
+        dialog.set_extra_child(content)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("import", "Import")
+        dialog.set_default_response("import")
+        dialog.set_close_response("cancel")
+
+        def _on_response(response_dialog, response):
+            response_dialog.close()
+            if response == "import":
+                on_submitted(host_row.get_text())
+            else:
+                on_cancelled()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+    except Exception:
+        on_error()
+
+
 def _choose_custom_ca_file(
     parent: Any,
     on_selected: Any,
@@ -514,6 +633,7 @@ class Plugin(SshPilotPlugin):
         self._inventory_spinner = None
         self._inventory_groups_box = None
         self._inventory_groups = []
+        self._guest_connection_buttons = []
         self._adw = None
         self._gtk = None
         self._page_token = None
@@ -538,6 +658,7 @@ class Plugin(SshPilotPlugin):
         self._page_token = object()
         self._operation_in_progress = False
         self._inventory_groups = []
+        self._guest_connection_buttons = []
         configuration = load_configuration(self.ctx.settings)
         try:
             self._custom_ca_enabled = _custom_ca_enabled(self.ctx.settings)
@@ -877,8 +998,163 @@ class Plugin(SshPilotPlugin):
         finally:
             self._set_busy(False)
 
+    def _guest_connection_error(self, message: str, page_token: object) -> None:
+        if page_token is not self._page_token:
+            return
+        self._set_status(message, "error")
+        self._set_busy(False)
+
+    def _open_guest_connection(self, nickname: str, page_token: object) -> None:
+        try:
+            opened = self.ctx.open_connection(nickname)
+        except Exception:
+            opened = False
+        if page_token is not self._page_token:
+            return
+        if opened:
+            self._set_status("SSH connection opened.", "success")
+            self._set_busy(False)
+        else:
+            self._guest_connection_error(
+                "The SSH connection could not be opened.",
+                page_token,
+            )
+
+    def _list_connections_for_guest_action(self, page_token: object) -> Any:
+        try:
+            return self.ctx.list_connections()
+        except Exception:
+            self._guest_connection_error(
+                "SSH Pilot connections are unavailable.",
+                page_token,
+            )
+            return None
+
+    def _on_guest_connection_clicked(
+        self,
+        button: Any,
+        guest: Any,
+        nickname: str,
+    ) -> None:
+        if self._operation_in_progress:
+            return
+        page_token = self._page_token
+        self._set_busy(True)
+        get_label = getattr(button, "get_label", None)
+        if callable(get_label) and get_label() == "Open":
+            self._open_guest_connection(nickname, page_token)
+            return
+        connections = self._list_connections_for_guest_action(page_token)
+        if connections is None:
+            return
+        existing = _connection_named(connections, nickname)
+        if existing is not None:
+            if getattr(existing, "protocol", "ssh") != "ssh":
+                self._guest_connection_error(
+                    "The SSH connection could not be imported.",
+                    page_token,
+                )
+                return
+            self._open_guest_connection(existing.nickname, page_token)
+            return
+
+        parent = None
+        get_root = getattr(button, "get_root", None)
+        if callable(get_root):
+            try:
+                parent = get_root()
+            except Exception:
+                parent = None
+        _prompt_ssh_host(
+            parent,
+            lambda host: self._on_guest_ssh_host_submitted(
+                host,
+                button,
+                guest,
+                nickname,
+                page_token,
+            ),
+            lambda: self._on_guest_ssh_host_cancelled(page_token),
+            lambda: self._guest_connection_error(
+                "The SSH host prompt could not be opened.",
+                page_token,
+            ),
+        )
+
+    def _on_guest_ssh_host_cancelled(self, page_token: object) -> None:
+        if page_token is not self._page_token:
+            return
+        self._set_busy(False)
+
+    def _on_guest_ssh_host_submitted(
+        self,
+        host: str,
+        button: Any,
+        guest: Any,
+        nickname: str,
+        page_token: object,
+    ) -> None:
+        if page_token is not self._page_token:
+            return
+        try:
+            normalized_host = normalize_ssh_host(host)
+        except ValueError:
+            self._guest_connection_error(
+                "Enter a valid SSH host or IP address.",
+                page_token,
+            )
+            return
+
+        connections = self._list_connections_for_guest_action(page_token)
+        if connections is None:
+            return
+        existing = _connection_named(connections, nickname)
+        if existing is not None:
+            if getattr(existing, "protocol", "ssh") != "ssh":
+                self._guest_connection_error(
+                    "The SSH connection could not be imported.",
+                    page_token,
+                )
+                return
+            button.set_label("Open")
+            self._open_guest_connection(existing.nickname, page_token)
+            return
+
+        guest_type = guest.guest_type.upper()
+        guest_title = guest.name or f"{guest_type} {guest.vmid}"
+        try:
+            self.ctx.add_connection(
+                {
+                    "nickname": nickname,
+                    "display_name": f"Proxmox: {guest_title}",
+                    "hostname": normalized_host,
+                    "port": SSH_PORT,
+                    "protocol": "ssh",
+                }
+            )
+        except Exception:
+            self._guest_connection_error(
+                "The SSH connection could not be imported.",
+                page_token,
+            )
+            return
+        if page_token is not self._page_token:
+            return
+        button.set_label("Open")
+        self._set_status("SSH connection imported.", "success")
+        self._set_busy(False)
+
     def _render_inventory(self, inventory: ProxmoxInventory) -> None:
         self._clear_inventory_groups()
+        configuration = load_configuration(self.ctx.settings)
+        try:
+            server_url = normalize_server_url(configuration["server_url"])
+        except ProxmoxValidationError:
+            server_url = None
+        try:
+            connections = self.ctx.list_connections()
+        except Exception:
+            connections = ()
         guests_by_node = {node.name: [] for node in inventory.nodes}
         for guest in inventory.guests:
             guests_by_node.setdefault(guest.node, []).append(guest)
@@ -914,6 +1190,41 @@ class Plugin(SshPilotPlugin):
                     template_label.add_css_class("dim-label")
                     template_label.set_valign(self._gtk.Align.CENTER)
                     row.add_suffix(template_label)
+                elif server_url is not None:
+                    nickname = guest_connection_nickname(
+                        server_url,
+                        guest.guest_type,
+                        guest.vmid,
+                    )
+                    existing = _connection_named(connections, nickname)
+                    is_ssh = (
+                        existing is not None
+                        and getattr(existing, "protocol", "ssh") == "ssh"
+                    )
+                    connection_button = self._gtk.Button(
+                        label="Open" if is_ssh else "Import…"
+                    )
+
+                    def _on_connection_clicked(
+                        clicked_button,
+                        selected_guest=guest,
+                        connection_nickname=nickname,
+                    ):
+                        self._on_guest_connection_clicked(
+                            clicked_button,
+                            selected_guest,
+                            connection_nickname,
+                        )
+
+                    connection_button.connect(
+                        "clicked",
+                        _on_connection_clicked,
+                    )
+                    connection_button.set_sensitive(
+                        not self._operation_in_progress
+                    )
+                    row.add_suffix(connection_button)
+                    self._guest_connection_buttons.append(connection_button)
                 group.add(row)
             self._inventory_groups_box.append(group)
             self._inventory_groups.append(group)
@@ -922,6 +1233,7 @@ class Plugin(SshPilotPlugin):
         for group in self._inventory_groups:
             self._inventory_groups_box.remove(group)
         self._inventory_groups.clear()
+        self._guest_connection_buttons.clear()
 
     def _set_busy(self, busy: bool) -> None:
         self._operation_in_progress = busy
@@ -932,6 +1244,8 @@ class Plugin(SshPilotPlugin):
         self._remove_custom_ca_button.set_sensitive(
             not busy and self._custom_ca_enabled
         )
+        for button in self._guest_connection_buttons:
+            button.set_sensitive(not busy)
 
     def _set_status(self, message: str, css_class: str) -> None:
         for current_class in ("dim-label", "success", "error"):
