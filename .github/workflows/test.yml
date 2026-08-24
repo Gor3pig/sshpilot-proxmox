@@ -1,16 +1,30 @@
+---
 name: test
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SSH_PILOT_SHA: 587c59a28efb71bf0e2e06a215415ec2acf288c6
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          python-version: "3.12"
-      - run: pip install pytest
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - run: python -m pip install "pytest==9.1.1"
       # sshpilot.plugins.api has no GTK dependency, so --no-deps skips PyGObject.
-      - run: pip install "sshpilot @ git+https://github.com/mfat/sshpilot" --no-deps
-      - run: pytest -ra
+      - run: |
+          python -m pip install \
+            "sshpilot @ git+https://github.com/mfat/sshpilot@${SSH_PILOT_SHA}" \
+            --no-deps
+      - run: python -m pytest -ra

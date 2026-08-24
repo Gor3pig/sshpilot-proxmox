@@ -1,0 +1,50 @@
+---
+name: upstream compatibility
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Resolve SSH Pilot upstream/main
+        id: sshpilot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          result="$(
+            git ls-remote \
+              https://github.com/mfat/sshpilot.git \
+              refs/heads/main
+          )"
+
+          if [[ ! "$result" =~ ^([0-9a-f]{40})[[:space:]]+refs/heads/main$ ]]; then
+            echo "Could not resolve a valid SSH Pilot upstream/main SHA." >&2
+            exit 1
+          fi
+
+          sha="${BASH_REMATCH[1]}"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'SSH Pilot upstream SHA: %s\n' "$sha"
+      - run: python -m pip install "pytest==9.1.1"
+      - env:
+          SSH_PILOT_SHA: ${{ steps.sshpilot.outputs.sha }}
+        run: |
+          python -m pip install \
+            "sshpilot @ git+https://github.com/mfat/sshpilot@${SSH_PILOT_SHA}" \
+            --no-deps
+      - run: python -m pytest -ra
