@@ -2281,6 +2281,84 @@ def test_refresh_start_removes_previous_inventory_before_worker(monkeypatch):
     assert plugin._inventory_status_row.title == "Loading inventory…"
 
 
+def test_successful_empty_refresh_replaces_non_empty_inventory(monkeypatch):
+    mod = _load()
+    _DeferredThread.created = []
+    monkeypatch.setattr(mod.threading, "Thread", _DeferredThread)
+    ctx = _Ctx()
+    ctx.settings = _Settings(
+        {
+            "server_url": "https://pve.test",
+            "token_user": "user@pve",
+            "token_id": "id",
+        }
+    )
+    ctx.secrets = _Secrets(readback="stored-secret")
+    plugin, _page = _build_headless_page(mod, ctx, monkeypatch)
+    plugin._finish_refresh(
+        _inventory_result(
+            mod,
+            nodes=[_api(mod).ProxmoxNode("old-node", "online")],
+            guests=[
+                _api(mod).ProxmoxGuest(
+                    "qemu", 100, "old-guest", "old-node", "running", False
+                )
+            ],
+        ),
+        plugin._page_token,
+    )
+    old_group = plugin._inventory_groups[0]
+    old_guest_row = old_group.rows[0]
+    assert old_group.title == "old-node"
+    assert old_guest_row.title == "old-guest"
+
+    expected = _inventory_result(mod)
+    client = _FakeInventoryClient(expected)
+    plugin._client_factory = lambda: client
+    page_token = plugin._page_token
+
+    plugin._on_refresh_clicked(None)
+
+    assert plugin._operation_in_progress is True
+    assert plugin._inventory_groups == []
+    assert plugin._inventory_groups_box.children == []
+    assert old_group not in plugin._inventory_groups_box.children
+    assert plugin._inventory_status_row.title == "Loading inventory…"
+    assert plugin._inventory_spinner.active is True
+    assert plugin._inventory_spinner.visible is True
+    assert plugin._save_button.sensitive_calls[-1] is False
+    assert plugin._test_button.sensitive_calls[-1] is False
+    assert plugin._refresh_button.sensitive_calls[-1] is False
+
+    worker = _DeferredThread.created[0]
+    worker.target(*worker.args)
+    callback, args = ctx.ui_thread_calls[0]
+    assert callback == plugin._finish_refresh
+    assert args == (expected, page_token)
+
+    callback(*args)
+
+    assert plugin._inventory_groups == []
+    assert plugin._inventory_groups_box.children == []
+    assert old_group not in plugin._inventory_groups_box.children
+    assert old_guest_row not in [
+        row
+        for group in plugin._inventory_groups_box.children
+        for row in group.rows
+    ]
+    assert plugin._inventory_status_row.title == (
+        "No nodes or guests visible to this API token were returned."
+    )
+    assert plugin._inventory_spinner.active is False
+    assert plugin._inventory_spinner.visible is False
+    assert plugin._operation_in_progress is False
+    assert plugin._save_button.sensitive_calls[-1] is True
+    assert plugin._test_button.sensitive_calls[-1] is True
+    assert plugin._refresh_button.sensitive_calls[-1] is True
+    assert plugin._import_custom_ca_button.sensitive_calls[-1] is True
+    assert plugin._remove_custom_ca_button.sensitive_calls[-1] is False
+
+
 def test_successive_inventory_results_replace_groups_without_accumulation(monkeypatch):
     mod = _load()
     plugin, _page = _build_headless_page(mod, _Ctx(), monkeypatch)
