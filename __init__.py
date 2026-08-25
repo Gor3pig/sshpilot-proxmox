@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,9 +47,29 @@ CONFIGURATION_KEY = "configuration"
 SECRET_KEY = "api_token_secret"
 CUSTOM_CA_ENABLED_KEY = "custom_ca_enabled"
 CUSTOM_CA_FILE = "custom-ca.pem"
+ENDPOINTS_KEY = "endpoints"
+ENDPOINT_MIGRATION_ID_KEY = "endpoint_migration_id"
+ENDPOINT_SCHEMA_VERSION = 1
+ENDPOINT_SECRET_KEY_PREFIX = "api_token_secret:"
+ENDPOINT_FILES_DIRECTORY = "endpoints"
+ENDPOINT_SECRET_SOURCE_LEGACY = "legacy"
+ENDPOINT_SECRET_SOURCE_ENDPOINT = "endpoint"
 MAX_CUSTOM_CA_BYTES = 1_048_576
 CONFIGURATION_FIELDS = ("server_url", "token_user", "token_id")
 SSH_PORT = 22
+
+_ENDPOINT_ID = re.compile(r"^[0-9a-f]{32}$")
+_ENDPOINT_ROOT_FIELDS = frozenset(
+    {"schema_version", "active_endpoint_id", "endpoints"}
+)
+_ENDPOINT_RECORD_FIELDS = frozenset(
+    {"endpoint_id", "configuration", "custom_ca_enabled", "secret_source"}
+)
+_ENDPOINT_CONFIGURATION_FIELDS = frozenset(CONFIGURATION_FIELDS)
+_ENDPOINT_SECRET_SOURCES = frozenset(
+    {ENDPOINT_SECRET_SOURCE_LEGACY, ENDPOINT_SECRET_SOURCE_ENDPOINT}
+)
+_ENDPOINT_MIGRATION_LOCK = threading.Lock()
 
 _SSH_HOST_LABEL = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
@@ -83,6 +104,534 @@ class CustomCAResult:
     success: bool
     enabled: bool | None
     message: str
+
+
+class EndpointStorageError(RuntimeError):
+    """Fixed internal error for unavailable or inconsistent endpoint storage."""
+
+
+class _EndpointMigrationConflict(RuntimeError):
+    """Internal signal that an unpublished migration ID must not be reused."""
+
+
+def _validate_endpoint_id(endpoint_id: Any) -> str:
+    if type(endpoint_id) is not str or not _ENDPOINT_ID.fullmatch(endpoint_id):
+        raise EndpointStorageError("Endpoint storage is unavailable.")
+    return endpoint_id
+
+
+def _strict_endpoint_configuration(value: Any) -> dict[str, str]:
+    if (
+        type(value) is not dict
+        or frozenset(value) != _ENDPOINT_CONFIGURATION_FIELDS
+        or any(type(value[field]) is not str for field in CONFIGURATION_FIELDS)
+    ):
+        raise EndpointStorageError("Endpoint storage is unavailable.")
+    return {field: value[field] for field in CONFIGURATION_FIELDS}
+
+
+def _get_setting_with_presence(settings: Any, key: str) -> tuple[bool, Any]:
+    marker = f"__sshpilot_proxmox_missing_{uuid.uuid4().hex}__"
+    value = settings.get(key, marker)
+    return value != marker, value
+
+
+@dataclass(frozen=True)
+class EndpointRecord:
+    """One non-sensitive endpoint record from the versioned collection."""
+
+    endpoint_id: str
+    server_url: str
+    token_user: str
+    token_id: str
+    custom_ca_enabled: bool
+    secret_source: str
+
+    @classmethod
+    def from_settings(cls, value: Any) -> EndpointRecord:
+        if type(value) is not dict or frozenset(value) != _ENDPOINT_RECORD_FIELDS:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        endpoint_id = _validate_endpoint_id(value.get("endpoint_id"))
+        configuration = _strict_endpoint_configuration(value.get("configuration"))
+        custom_ca_enabled = value.get("custom_ca_enabled")
+        if type(custom_ca_enabled) is not bool:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        secret_source = value.get("secret_source")
+        if type(secret_source) is not str or secret_source not in _ENDPOINT_SECRET_SOURCES:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return cls(
+            endpoint_id=endpoint_id,
+            server_url=configuration["server_url"],
+            token_user=configuration["token_user"],
+            token_id=configuration["token_id"],
+            custom_ca_enabled=custom_ca_enabled,
+            secret_source=secret_source,
+        )
+
+    @property
+    def configuration(self) -> dict[str, str]:
+        return {
+            "server_url": self.server_url,
+            "token_user": self.token_user,
+            "token_id": self.token_id,
+        }
+
+    def to_settings(self) -> dict[str, Any]:
+        return {
+            "endpoint_id": self.endpoint_id,
+            "configuration": self.configuration,
+            "custom_ca_enabled": self.custom_ca_enabled,
+            "secret_source": self.secret_source,
+        }
+
+    def with_configuration(self, configuration: dict[str, str]) -> EndpointRecord:
+        normalized = _strict_endpoint_configuration(configuration)
+        return EndpointRecord(
+            endpoint_id=self.endpoint_id,
+            server_url=normalized["server_url"],
+            token_user=normalized["token_user"],
+            token_id=normalized["token_id"],
+            custom_ca_enabled=self.custom_ca_enabled,
+            secret_source=self.secret_source,
+        )
+
+    def with_secret_source(self, secret_source: str) -> EndpointRecord:
+        if type(secret_source) is not str or secret_source not in _ENDPOINT_SECRET_SOURCES:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return EndpointRecord(
+            endpoint_id=self.endpoint_id,
+            server_url=self.server_url,
+            token_user=self.token_user,
+            token_id=self.token_id,
+            custom_ca_enabled=self.custom_ca_enabled,
+            secret_source=secret_source,
+        )
+
+
+@dataclass(frozen=True)
+class EndpointCollection:
+    """Versioned endpoint metadata stored entirely in non-secret settings."""
+
+    active_endpoint_id: str
+    endpoints: tuple[EndpointRecord, ...]
+
+    @classmethod
+    def from_settings(cls, value: Any) -> EndpointCollection:
+        if (
+            type(value) is not dict
+            or frozenset(value) != _ENDPOINT_ROOT_FIELDS
+            or type(value.get("schema_version")) is not int
+            or value.get("schema_version") != ENDPOINT_SCHEMA_VERSION
+            or type(value.get("endpoints")) is not list
+            or not value["endpoints"]
+        ):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        active_endpoint_id = _validate_endpoint_id(value.get("active_endpoint_id"))
+        endpoints = tuple(
+            EndpointRecord.from_settings(endpoint)
+            for endpoint in value["endpoints"]
+        )
+        endpoint_ids = [endpoint.endpoint_id for endpoint in endpoints]
+        if (
+            len(set(endpoint_ids)) != len(endpoint_ids)
+            or active_endpoint_id not in endpoint_ids
+        ):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return cls(active_endpoint_id=active_endpoint_id, endpoints=endpoints)
+
+    @property
+    def active_endpoint(self) -> EndpointRecord:
+        return next(
+            endpoint
+            for endpoint in self.endpoints
+            if endpoint.endpoint_id == self.active_endpoint_id
+        )
+
+    def to_settings(self) -> dict[str, Any]:
+        return {
+            "schema_version": ENDPOINT_SCHEMA_VERSION,
+            "active_endpoint_id": self.active_endpoint_id,
+            "endpoints": [endpoint.to_settings() for endpoint in self.endpoints],
+        }
+
+    def with_configuration(
+        self,
+        endpoint_id: str,
+        configuration: dict[str, str],
+    ) -> EndpointCollection:
+        endpoint_id = _validate_endpoint_id(endpoint_id)
+        if not any(endpoint.endpoint_id == endpoint_id for endpoint in self.endpoints):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return EndpointCollection(
+            active_endpoint_id=self.active_endpoint_id,
+            endpoints=tuple(
+                endpoint.with_configuration(configuration)
+                if endpoint.endpoint_id == endpoint_id
+                else endpoint
+                for endpoint in self.endpoints
+            ),
+        )
+
+    def with_secret_source(
+        self,
+        endpoint_id: str,
+        secret_source: str,
+    ) -> EndpointCollection:
+        endpoint_id = _validate_endpoint_id(endpoint_id)
+        if not any(endpoint.endpoint_id == endpoint_id for endpoint in self.endpoints):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return EndpointCollection(
+            active_endpoint_id=self.active_endpoint_id,
+            endpoints=tuple(
+                endpoint.with_secret_source(secret_source)
+                if endpoint.endpoint_id == endpoint_id
+                else endpoint
+                for endpoint in self.endpoints
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _LegacyEndpointSnapshot:
+    configuration: dict[str, str]
+    custom_ca_enabled: bool
+    secret: str | None
+    custom_ca_pem: str | None
+
+
+def _read_private_file_bounded(files: Any, relative_path: str) -> bytes:
+    path = files.path(relative_path)
+    with open(path, "rb") as stored:
+        value = stored.read(MAX_CUSTOM_CA_BYTES + 1)
+    if len(value) > MAX_CUSTOM_CA_BYTES:
+        raise EndpointStorageError("Endpoint storage is unavailable.")
+    return value
+
+
+class EndpointStore:
+    """Non-destructive storage foundation for versioned Proxmox endpoints."""
+
+    def __init__(self, settings: Any, secrets: Any, files: Any, id_factory=None):
+        self._settings = settings
+        self._secrets = secrets
+        self._files = files
+        self._id_factory = id_factory if id_factory is not None else _new_endpoint_id
+
+    @staticmethod
+    def secret_key(endpoint_id: str) -> str:
+        return f"{ENDPOINT_SECRET_KEY_PREFIX}{_validate_endpoint_id(endpoint_id)}"
+
+    @staticmethod
+    def custom_ca_file(endpoint_id: str) -> str:
+        return (
+            f"{ENDPOINT_FILES_DIRECTORY}/"
+            f"{_validate_endpoint_id(endpoint_id)}/{CUSTOM_CA_FILE}"
+        )
+
+    def load(self) -> EndpointCollection | None:
+        try:
+            present, value = _get_setting_with_presence(
+                self._settings,
+                ENDPOINTS_KEY,
+            )
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if not present:
+            return None
+        return EndpointCollection.from_settings(value)
+
+    def save(self, collection: EndpointCollection) -> None:
+        value = collection.to_settings()
+        EndpointCollection.from_settings(value)
+        try:
+            self._settings.set(ENDPOINTS_KEY, value)
+            present, confirmed = _get_setting_with_presence(
+                self._settings,
+                ENDPOINTS_KEY,
+            )
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if not present:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        confirmed_value = EndpointCollection.from_settings(confirmed).to_settings()
+        if confirmed_value != value:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+
+    def update_configuration(
+        self,
+        endpoint_id: str,
+        configuration: dict[str, str],
+    ) -> EndpointCollection:
+        collection = self.load()
+        if collection is None:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        updated = collection.with_configuration(endpoint_id, configuration)
+        self.save(updated)
+        return updated
+
+    def get_secret(self, endpoint_id: str) -> str | None:
+        try:
+            return self._secrets.get(self.secret_key(endpoint_id))
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+
+    def resolve_secret(self, endpoint: EndpointRecord) -> str | None:
+        if not isinstance(endpoint, EndpointRecord):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        try:
+            if endpoint.secret_source == ENDPOINT_SECRET_SOURCE_LEGACY:
+                return self._secrets.get(SECRET_KEY)
+            if endpoint.secret_source == ENDPOINT_SECRET_SOURCE_ENDPOINT:
+                return self._secrets.get(self.secret_key(endpoint.endpoint_id))
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        raise EndpointStorageError("Endpoint storage is unavailable.")
+
+    def set_secret(self, endpoint_id: str, secret: str) -> None:
+        key = self.secret_key(endpoint_id)
+        if type(secret) is not str or not secret:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        try:
+            self._secrets.set(key, secret)
+            confirmed = self._secrets.get(key)
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if confirmed != secret:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+
+    def promote_secret(self, endpoint_id: str, secret: str) -> EndpointCollection:
+        endpoint_id = _validate_endpoint_id(endpoint_id)
+        self.set_secret(endpoint_id, secret)
+        collection = self.load()
+        if collection is None:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        updated = collection.with_secret_source(
+            endpoint_id,
+            ENDPOINT_SECRET_SOURCE_ENDPOINT,
+        )
+        self.save(updated)
+        return updated
+
+    def read_custom_ca(self, endpoint_id: str) -> str:
+        try:
+            raw = _read_private_file_bounded(
+                self._files,
+                self.custom_ca_file(endpoint_id),
+            )
+            return validate_custom_ca_pem(raw)
+        except EndpointStorageError:
+            raise
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+
+    def write_custom_ca(self, endpoint_id: str, value: bytes | str) -> None:
+        try:
+            pem = validate_custom_ca_pem(value)
+            _write_custom_ca_file(
+                self._files,
+                self.custom_ca_file(endpoint_id),
+                pem,
+            )
+        except EndpointStorageError:
+            raise
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+
+    def materialize_legacy(self) -> EndpointCollection | None:
+        with _ENDPOINT_MIGRATION_LOCK:
+            return self._materialize_legacy_locked()
+
+    def _materialize_legacy_locked(self) -> EndpointCollection | None:
+        existing = self.load()
+        if existing is not None:
+            return existing
+
+        snapshot = self._read_legacy_snapshot()
+        if snapshot is None:
+            return None
+
+        endpoint_id = self._migration_endpoint_id()
+        try:
+            secret_source = self._copy_legacy_secret(endpoint_id, snapshot.secret)
+            if snapshot.custom_ca_enabled:
+                self._copy_legacy_custom_ca(endpoint_id, snapshot.custom_ca_pem)
+        except _EndpointMigrationConflict as exc:
+            self._rotate_migration_endpoint_id(endpoint_id)
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+
+        confirmed_snapshot = self._read_legacy_snapshot()
+        if confirmed_snapshot != snapshot:
+            self._rotate_migration_endpoint_id(endpoint_id)
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        concurrent_model = self.load()
+        if concurrent_model is not None:
+            return concurrent_model
+        self._confirm_migration_endpoint_id(endpoint_id)
+
+        collection = EndpointCollection(
+            active_endpoint_id=endpoint_id,
+            endpoints=(
+                EndpointRecord(
+                    endpoint_id=endpoint_id,
+                    server_url=snapshot.configuration["server_url"],
+                    token_user=snapshot.configuration["token_user"],
+                    token_id=snapshot.configuration["token_id"],
+                    custom_ca_enabled=snapshot.custom_ca_enabled,
+                    secret_source=secret_source,
+                ),
+            ),
+        )
+        self.save(collection)
+        return collection
+
+    def _read_legacy_snapshot(self) -> _LegacyEndpointSnapshot | None:
+        try:
+            configuration_present, legacy_configuration = _get_setting_with_presence(
+                self._settings,
+                CONFIGURATION_KEY,
+            )
+            if not configuration_present:
+                return None
+            legacy_ca_enabled = self._settings.get(CUSTOM_CA_ENABLED_KEY, False)
+            legacy_secret = self._secrets.get(SECRET_KEY)
+            legacy_ca_pem = (
+                validate_custom_ca_pem(
+                    _read_private_file_bounded(self._files, CUSTOM_CA_FILE)
+                )
+                if legacy_ca_enabled is True
+                else None
+            )
+        except EndpointStorageError:
+            raise
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if type(legacy_ca_enabled) is not bool or (
+            legacy_secret is not None and type(legacy_secret) is not str
+        ):
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return _LegacyEndpointSnapshot(
+            configuration=normalize_configuration(legacy_configuration),
+            custom_ca_enabled=legacy_ca_enabled,
+            secret=legacy_secret,
+            custom_ca_pem=legacy_ca_pem,
+        )
+
+    def _migration_endpoint_id(self) -> str:
+        try:
+            present, endpoint_id = _get_setting_with_presence(
+                self._settings,
+                ENDPOINT_MIGRATION_ID_KEY,
+            )
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if present:
+            return _validate_endpoint_id(endpoint_id)
+
+        endpoint_id = _validate_endpoint_id(self._id_factory())
+        try:
+            self._settings.set(ENDPOINT_MIGRATION_ID_KEY, endpoint_id)
+            confirmed_present, confirmed = _get_setting_with_presence(
+                self._settings,
+                ENDPOINT_MIGRATION_ID_KEY,
+            )
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if not confirmed_present or confirmed != endpoint_id:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        return endpoint_id
+
+    def _rotate_migration_endpoint_id(self, previous_endpoint_id: str) -> None:
+        previous_endpoint_id = _validate_endpoint_id(previous_endpoint_id)
+        try:
+            present, current_endpoint_id = _get_setting_with_presence(
+                self._settings,
+                ENDPOINT_MIGRATION_ID_KEY,
+            )
+            if not present or current_endpoint_id != previous_endpoint_id:
+                raise EndpointStorageError("Endpoint storage is unavailable.")
+            replacement_endpoint_id = _validate_endpoint_id(self._id_factory())
+            if replacement_endpoint_id == previous_endpoint_id:
+                raise EndpointStorageError("Endpoint storage is unavailable.")
+            self._settings.set(
+                ENDPOINT_MIGRATION_ID_KEY,
+                replacement_endpoint_id,
+            )
+            confirmed_present, confirmed = _get_setting_with_presence(
+                self._settings,
+                ENDPOINT_MIGRATION_ID_KEY,
+            )
+        except EndpointStorageError:
+            raise
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if not confirmed_present or confirmed != replacement_endpoint_id:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+
+    def _confirm_migration_endpoint_id(self, endpoint_id: str) -> None:
+        endpoint_id = _validate_endpoint_id(endpoint_id)
+        try:
+            present, confirmed = _get_setting_with_presence(
+                self._settings,
+                ENDPOINT_MIGRATION_ID_KEY,
+            )
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if not present or confirmed != endpoint_id:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+
+    def _copy_legacy_secret(
+        self,
+        endpoint_id: str,
+        legacy_secret: str | None,
+    ) -> str:
+        destination_key = self.secret_key(endpoint_id)
+        try:
+            destination_secret = self._secrets.get(destination_key)
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+        if legacy_secret is None:
+            return ENDPOINT_SECRET_SOURCE_LEGACY
+        if destination_secret is None:
+            self.set_secret(endpoint_id, legacy_secret)
+        elif destination_secret != legacy_secret:
+            raise _EndpointMigrationConflict
+        return ENDPOINT_SECRET_SOURCE_ENDPOINT
+
+    def _copy_legacy_custom_ca(
+        self,
+        endpoint_id: str,
+        legacy_ca_pem: str | None,
+    ) -> None:
+        if legacy_ca_pem is None:
+            raise EndpointStorageError("Endpoint storage is unavailable.")
+        try:
+            destination = self.custom_ca_file(endpoint_id)
+            try:
+                existing = _read_private_file_bounded(self._files, destination)
+            except FileNotFoundError:
+                existing = None
+            except EndpointStorageError as exc:
+                raise _EndpointMigrationConflict from exc
+            expected = legacy_ca_pem.encode("ascii")
+            if existing is None:
+                _write_custom_ca_file(self._files, destination, legacy_ca_pem)
+            elif existing != expected:
+                raise _EndpointMigrationConflict
+            mode = os.stat(self._files.path(destination)).st_mode & 0o777
+            if mode != 0o600:
+                raise _EndpointMigrationConflict
+            if self.read_custom_ca(endpoint_id) != legacy_ca_pem:
+                raise EndpointStorageError("Endpoint storage is unavailable.")
+        except EndpointStorageError:
+            raise
+        except _EndpointMigrationConflict:
+            raise
+        except Exception as exc:
+            raise EndpointStorageError("Endpoint storage is unavailable.") from exc
+
+
+def _new_endpoint_id() -> str:
+    return uuid.uuid4().hex
 
 
 def normalize_configuration(value: Any) -> dict[str, str]:
@@ -206,12 +755,13 @@ def _read_custom_ca_source(source_path: str) -> bytes:
     return data
 
 
-def _write_custom_ca(files: Any, pem: str) -> None:
-    final_path = files.path(CUSTOM_CA_FILE)
+def _write_custom_ca_file(files: Any, relative_path: str, pem: str) -> None:
+    final_path = files.path(relative_path)
     directory = os.path.dirname(final_path)
     descriptor = None
     temporary_path = None
     try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
         descriptor, temporary_path = tempfile.mkstemp(
             dir=directory,
             prefix=".custom-ca-",
@@ -237,6 +787,10 @@ def _write_custom_ca(files: Any, pem: str) -> None:
             except OSError:
                 pass
         raise
+
+
+def _write_custom_ca(files: Any, pem: str) -> None:
+    _write_custom_ca_file(files, CUSTOM_CA_FILE, pem)
 
 
 def import_custom_ca(settings: Any, files: Any, source_path: str) -> CustomCAResult:

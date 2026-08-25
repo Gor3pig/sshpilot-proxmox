@@ -144,6 +144,107 @@ class _Secrets:
         return False
 
 
+class _KeyedSettings:
+    def __init__(
+        self,
+        values=None,
+        *,
+        fail_get_once=None,
+        fail_set_once=None,
+        set_then_fail_once=None,
+        get_sequences=None,
+    ):
+        self.values = dict(values or {})
+        self.fail_get_once = set(fail_get_once or ())
+        self.fail_set_once = set(fail_set_once or ())
+        self.set_then_fail_once = set(set_then_fail_once or ())
+        self.get_sequences = {
+            key: list(sequence) for key, sequence in (get_sequences or {}).items()
+        }
+        self.get_calls = []
+        self.set_calls = []
+
+    def get(self, key, default=None):
+        self.get_calls.append((key, default))
+        if key in self.fail_get_once:
+            self.fail_get_once.remove(key)
+            raise RuntimeError("settings unavailable")
+        sequence = self.get_sequences.get(key)
+        if sequence:
+            value = sequence.pop(0)
+            return default if value is MISSING else value
+        return self.values.get(key, default)
+
+    def set(self, key, value):
+        self.set_calls.append((key, value))
+        if key in self.fail_set_once:
+            self.fail_set_once.remove(key)
+            raise RuntimeError("settings unavailable")
+        self.values[key] = value
+        if key in self.set_then_fail_once:
+            self.set_then_fail_once.remove(key)
+            raise RuntimeError("settings readback unavailable")
+
+
+class _KeyedSecrets:
+    def __init__(self, values=None, *, fail_set_once=None, get_sequences=None):
+        self.values = dict(values or {})
+        self.fail_set_once = set(fail_set_once or ())
+        self.get_sequences = {
+            key: list(sequence) for key, sequence in (get_sequences or {}).items()
+        }
+        self.calls = []
+
+    def get(self, key):
+        self.calls.append(("get", key))
+        sequence = self.get_sequences.get(key)
+        if sequence:
+            return sequence.pop(0)
+        return self.values.get(key)
+
+    def set(self, key, value):
+        self.calls.append(("set", key, value))
+        if key in self.fail_set_once:
+            self.fail_set_once.remove(key)
+            raise RuntimeError("secure storage unavailable")
+        self.values[key] = value
+
+    def delete(self, key):
+        self.calls.append(("delete", key))
+        return self.values.pop(key, None) is not None
+
+
+def _endpoint_model(
+    mod,
+    endpoint_id="b" * 32,
+    *,
+    active_endpoint_id=None,
+    configuration=None,
+    custom_ca_enabled=False,
+    secret_source=None,
+):
+    if configuration is None:
+        configuration = {
+            "server_url": "https://pve.example.test:8006",
+            "token_user": "automation@pve",
+            "token_id": "sshpilot",
+        }
+    if secret_source is None:
+        secret_source = mod.ENDPOINT_SECRET_SOURCE_LEGACY
+    return {
+        "schema_version": mod.ENDPOINT_SCHEMA_VERSION,
+        "active_endpoint_id": active_endpoint_id or endpoint_id,
+        "endpoints": [
+            {
+                "endpoint_id": endpoint_id,
+                "configuration": configuration,
+                "custom_ca_enabled": custom_ca_enabled,
+                "secret_source": secret_source,
+            }
+        ],
+    }
+
+
 class _Ctx:
     def __init__(self):
         self.pages = []
@@ -642,6 +743,1185 @@ def test_load_configuration_handles_settings_errors():
         "token_user": "",
         "token_id": "",
     }
+
+
+def test_endpoint_store_materializes_legacy_metadata_without_secret_or_ca(
+    tmp_path,
+):
+    mod = _load()
+    configuration = {
+        "server_url": "https://pve.example.test:8006",
+        "token_user": "automation@pve",
+        "token_id": "sshpilot",
+    }
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: configuration,
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets()
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+    )
+
+    collection = store.materialize_legacy()
+    endpoint_id = collection.active_endpoint_id
+
+    assert mod._ENDPOINT_ID.fullmatch(endpoint_id)
+    assert collection.active_endpoint_id == endpoint_id
+    assert collection.active_endpoint.configuration == configuration
+    assert collection.active_endpoint.custom_ca_enabled is False
+    assert collection.active_endpoint.secret_source == (
+        mod.ENDPOINT_SECRET_SOURCE_LEGACY
+    )
+    assert settings.values[mod.ENDPOINTS_KEY] == {
+        "schema_version": 1,
+        "active_endpoint_id": endpoint_id,
+        "endpoints": [
+            {
+                "endpoint_id": endpoint_id,
+                "configuration": configuration,
+                "custom_ca_enabled": False,
+                "secret_source": mod.ENDPOINT_SECRET_SOURCE_LEGACY,
+            }
+        ],
+    }
+    assert settings.values[mod.CONFIGURATION_KEY] == configuration
+    assert settings.values[mod.CUSTOM_CA_ENABLED_KEY] is False
+    assert secrets.values == {}
+    assert mod.SECRET_KEY not in repr(settings.values[mod.ENDPOINTS_KEY])
+    json.dumps(settings.values[mod.ENDPOINTS_KEY])
+    set_calls = list(settings.set_calls)
+
+    assert store.materialize_legacy() == collection
+    assert settings.set_calls == set_calls
+
+
+def test_endpoint_store_materializes_legacy_secret_and_custom_ca(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    endpoint_id = "2" * 32
+    secret = "legacy-token-secret"
+    ca = b"public-ca"
+    configuration = {
+        "server_url": "https://pve.example.test:8006",
+        "token_user": "automation@pve",
+        "token_id": "sshpilot",
+    }
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: configuration,
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: secret})
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(ca)
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint.custom_ca_enabled is True
+    assert collection.active_endpoint.secret_source == (
+        mod.ENDPOINT_SECRET_SOURCE_ENDPOINT
+    )
+    assert secrets.values[mod.SECRET_KEY] == secret
+    assert secrets.values[store.secret_key(endpoint_id)] == secret
+    assert (tmp_path / mod.CUSTOM_CA_FILE).read_bytes() == ca
+    endpoint_ca = tmp_path / store.custom_ca_file(endpoint_id)
+    assert endpoint_ca.read_bytes() == ca
+    assert endpoint_ca.stat().st_mode & 0o777 == 0o600
+    assert secret not in repr(settings.values)
+
+
+def test_endpoint_store_reuses_existing_model_without_repeating_migration(
+    tmp_path,
+):
+    mod = _load()
+    endpoint_id = "3" * 32
+    persisted = _endpoint_model(
+        mod,
+        endpoint_id,
+        configuration={
+            "server_url": "https://new.example.test:8006",
+            "token_user": "new@pve",
+            "token_id": "new-token",
+        },
+    )
+    settings = _KeyedSettings(
+        {
+            mod.ENDPOINTS_KEY: persisted,
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://legacy.example.test:8006",
+            },
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: "legacy-secret"})
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: pytest.fail("an existing model must not allocate an id"),
+    )
+
+    first = store.materialize_legacy()
+    second = store.materialize_legacy()
+
+    assert first == second
+    assert first.active_endpoint.server_url == "https://new.example.test:8006"
+    assert settings.set_calls == []
+    assert secrets.calls == []
+
+
+def test_endpoint_url_can_change_without_changing_opaque_endpoint_id(tmp_path):
+    mod = _load()
+    endpoint_id = "4" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://old.example.test:8006",
+                "token_user": "automation@pve",
+                "token_id": "sshpilot",
+            },
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+    store.materialize_legacy()
+
+    updated = store.update_configuration(
+        endpoint_id,
+        {
+            "server_url": "https://new.example.test:8006",
+            "token_user": "automation@pve",
+            "token_id": "sshpilot",
+        },
+    )
+
+    assert updated.active_endpoint_id == endpoint_id
+    assert updated.active_endpoint.endpoint_id == endpoint_id
+    assert updated.active_endpoint.server_url == "https://new.example.test:8006"
+
+
+def test_endpoint_secret_and_custom_ca_storage_are_isolated(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    first_id = "5" * 32
+    second_id = "6" * 32
+    secrets = _KeyedSecrets()
+    store = mod.EndpointStore(
+        _KeyedSettings(),
+        secrets,
+        _Files(str(tmp_path)),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+
+    store.set_secret(first_id, "first-secret")
+    store.set_secret(second_id, "second-secret")
+    store.write_custom_ca(first_id, b"first-ca")
+    store.write_custom_ca(second_id, b"second-ca")
+
+    assert store.get_secret(first_id) == "first-secret"
+    assert store.get_secret(second_id) == "second-secret"
+    assert store.read_custom_ca(first_id) == "first-ca"
+    assert store.read_custom_ca(second_id) == "second-ca"
+    assert store.secret_key(first_id) != store.secret_key(second_id)
+    assert store.custom_ca_file(first_id) != store.custom_ca_file(second_id)
+
+
+def test_endpoint_migration_retries_after_secret_copy_failure(tmp_path):
+    mod = _load()
+    endpoint_id = "7" * 32
+    destination_key = f"{mod.ENDPOINT_SECRET_KEY_PREFIX}{endpoint_id}"
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://pve.example.test:8006",
+                "token_user": "automation@pve",
+                "token_id": "sshpilot",
+            },
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets(
+        {mod.SECRET_KEY: "legacy-secret"},
+        fail_set_once={destination_key},
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == endpoint_id
+    assert secrets.values[mod.SECRET_KEY] == "legacy-secret"
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == endpoint_id
+    assert secrets.values[destination_key] == "legacy-secret"
+
+
+def test_endpoint_migration_retries_after_collection_commit_failure(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    endpoint_id = "8" * 32
+    secret = "legacy-secret"
+    ca = b"public-ca"
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://pve.example.test:8006",
+                "token_user": "automation@pve",
+                "token_id": "sshpilot",
+            },
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        },
+        fail_set_once={mod.ENDPOINTS_KEY},
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: secret})
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(ca)
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert secrets.values[store.secret_key(endpoint_id)] == secret
+    assert (
+        tmp_path / store.custom_ca_file(endpoint_id)
+    ).read_bytes() == ca
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == endpoint_id
+    assert settings.values[mod.CONFIGURATION_KEY]["server_url"] == (
+        "https://pve.example.test:8006"
+    )
+    assert settings.values[mod.CUSTOM_CA_ENABLED_KEY] is True
+    assert secrets.values[mod.SECRET_KEY] == secret
+
+
+def test_endpoint_migration_fails_closed_when_enabled_legacy_ca_is_missing(
+    tmp_path,
+):
+    mod = _load()
+    endpoint_id = "a" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://pve.example.test:8006",
+                "token_user": "automation@pve",
+                "token_id": "sshpilot",
+            },
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    with pytest.raises(mod.EndpointStorageError) as raised:
+        store.materialize_legacy()
+
+    assert str(raised.value) == "Endpoint storage is unavailable."
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.CUSTOM_CA_ENABLED_KEY] is True
+
+
+def test_endpoint_store_rejects_a_malformed_existing_model_without_migrating(
+    tmp_path,
+):
+    mod = _load()
+    settings = _KeyedSettings(
+        {
+            mod.ENDPOINTS_KEY: {
+                "schema_version": 1,
+                "active_endpoint_id": "not-an-endpoint-id",
+                "endpoints": [],
+            },
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://legacy.example.test:8006",
+            },
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: "legacy-secret"})
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: pytest.fail("corrupt storage must not be replaced"),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert settings.set_calls == []
+    assert secrets.calls == []
+
+
+def test_endpoint_model_settings_never_contain_per_endpoint_secrets(tmp_path):
+    mod = _load()
+    endpoint_id = "9" * 32
+    secret = "token-value-that-must-remain-private"
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {
+                "server_url": "https://pve.example.test:8006",
+                "token_user": "automation@pve",
+                "token_id": "sshpilot",
+            },
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: secret})
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    store.materialize_legacy()
+
+    assert secret not in repr(settings.values)
+    assert mod.SECRET_KEY not in repr(settings.values[mod.ENDPOINTS_KEY])
+
+
+def test_endpoint_store_does_not_materialize_absent_legacy_configuration(tmp_path):
+    mod = _load()
+    settings = _KeyedSettings()
+    secrets = _KeyedSecrets()
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: pytest.fail("absent configuration must not allocate an id"),
+    )
+
+    assert store.materialize_legacy() is None
+    assert settings.set_calls == []
+    assert secrets.calls == []
+    assert mod.ENDPOINT_MIGRATION_ID_KEY not in settings.values
+    assert mod.ENDPOINTS_KEY not in settings.values
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "root_non_dict",
+        "root_extra",
+        "schema_bool",
+        "schema_unknown",
+        "endpoints_non_list",
+        "endpoints_empty",
+        "endpoint_non_dict",
+        "endpoint_extra",
+        "endpoint_id_invalid",
+        "endpoint_id_duplicate",
+        "active_missing",
+        "active_unknown",
+        "configuration_missing",
+        "configuration_non_dict",
+        "server_url_missing",
+        "token_user_missing",
+        "token_id_missing",
+        "server_url_non_string",
+        "token_user_non_string",
+        "token_id_non_string",
+        "configuration_extra",
+        "custom_ca_missing",
+        "custom_ca_non_bool",
+        "secret_source_missing",
+        "secret_source_unknown",
+    ],
+)
+def test_endpoint_store_rejects_invalid_schema_v1_payloads(tmp_path, case):
+    mod = _load()
+    endpoint_id = "b" * 32
+    payload = _endpoint_model(mod, endpoint_id)
+
+    if case == "root_non_dict":
+        payload = []
+    elif case == "root_extra":
+        payload["unexpected"] = True
+    elif case == "schema_bool":
+        payload["schema_version"] = True
+    elif case == "schema_unknown":
+        payload["schema_version"] = 2
+    elif case == "endpoints_non_list":
+        payload["endpoints"] = {}
+    elif case == "endpoints_empty":
+        payload["endpoints"] = []
+    elif case == "endpoint_non_dict":
+        payload["endpoints"] = [None]
+    elif case == "endpoint_extra":
+        payload["endpoints"][0]["unexpected"] = True
+    elif case == "endpoint_id_invalid":
+        payload["endpoints"][0]["endpoint_id"] = "invalid"
+    elif case == "endpoint_id_duplicate":
+        payload["endpoints"].append(dict(payload["endpoints"][0]))
+    elif case == "active_missing":
+        payload.pop("active_endpoint_id")
+    elif case == "active_unknown":
+        payload["active_endpoint_id"] = "c" * 32
+    elif case == "configuration_missing":
+        payload["endpoints"][0].pop("configuration")
+    elif case == "configuration_non_dict":
+        payload["endpoints"][0]["configuration"] = []
+    elif case.endswith("_missing") and case.split("_missing")[0] in {
+        "server_url",
+        "token_user",
+        "token_id",
+    }:
+        payload["endpoints"][0]["configuration"].pop(
+            case.removesuffix("_missing")
+        )
+    elif case.endswith("_non_string"):
+        payload["endpoints"][0]["configuration"][
+            case.removesuffix("_non_string")
+        ] = 1
+    elif case == "configuration_extra":
+        payload["endpoints"][0]["configuration"]["unexpected"] = "value"
+    elif case == "custom_ca_missing":
+        payload["endpoints"][0].pop("custom_ca_enabled")
+    elif case == "custom_ca_non_bool":
+        payload["endpoints"][0]["custom_ca_enabled"] = 1
+    elif case == "secret_source_missing":
+        payload["endpoints"][0].pop("secret_source")
+    elif case == "secret_source_unknown":
+        payload["endpoints"][0]["secret_source"] = "unknown"
+
+    store = mod.EndpointStore(
+        _KeyedSettings({mod.ENDPOINTS_KEY: payload}),
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    with pytest.raises(mod.EndpointStorageError) as raised:
+        store.load()
+
+    assert str(raised.value) == "Endpoint storage is unavailable."
+
+
+@pytest.mark.parametrize("case", ["schema_bool", "custom_ca_integer"])
+def test_endpoint_store_save_rejects_type_coercing_readback(tmp_path, case):
+    mod = _load()
+    expected = _endpoint_model(mod)
+    confirmed = _endpoint_model(mod)
+    if case == "schema_bool":
+        confirmed["schema_version"] = True
+    else:
+        confirmed["endpoints"][0]["custom_ca_enabled"] = 0
+    assert confirmed == expected
+    with pytest.raises(mod.EndpointStorageError):
+        mod.EndpointCollection.from_settings(confirmed)
+    settings = _KeyedSettings(
+        get_sequences={mod.ENDPOINTS_KEY: [confirmed]},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    with pytest.raises(mod.EndpointStorageError) as raised:
+        store.save(mod.EndpointCollection.from_settings(expected))
+
+    assert str(raised.value) == "Endpoint storage is unavailable."
+
+
+def test_endpoint_store_save_rejects_valid_but_different_readback(tmp_path):
+    mod = _load()
+    expected = _endpoint_model(mod)
+    confirmed = _endpoint_model(
+        mod,
+        configuration={
+            "server_url": "https://different.example.test:8006",
+            "token_user": "automation@pve",
+            "token_id": "sshpilot",
+        },
+    )
+    settings = _KeyedSettings(
+        get_sequences={mod.ENDPOINTS_KEY: [confirmed]},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.save(mod.EndpointCollection.from_settings(expected))
+
+
+def test_endpoint_store_save_accepts_strictly_identical_readback(tmp_path):
+    mod = _load()
+    expected = _endpoint_model(mod)
+    settings = _KeyedSettings()
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    store.save(mod.EndpointCollection.from_settings(expected))
+
+    assert settings.values[mod.ENDPOINTS_KEY] == expected
+    assert store.load().to_settings() == expected
+
+
+def test_endpoint_migration_keeps_legacy_secret_fallback_when_lookup_is_none(
+    tmp_path,
+):
+    mod = _load()
+    endpoint_id = "c" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets(
+        get_sequences={mod.SECRET_KEY: [None, None, "available-later"]}
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint.secret_source == (
+        mod.ENDPOINT_SECRET_SOURCE_LEGACY
+    )
+    assert store.resolve_secret(collection.active_endpoint) == "available-later"
+    assert store.secret_key(endpoint_id) not in secrets.values
+    assert "available-later" not in repr(settings.values)
+
+
+def test_endpoint_migration_reuses_an_identical_namespaced_secret(tmp_path):
+    mod = _load()
+    endpoint_id = "d" * 32
+    secret = "legacy-secret"
+    destination = mod.EndpointStore.secret_key(endpoint_id)
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: secret, destination: secret})
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint.secret_source == (
+        mod.ENDPOINT_SECRET_SOURCE_ENDPOINT
+    )
+    assert store.resolve_secret(collection.active_endpoint) == secret
+    assert not any(call[0] == "set" for call in secrets.calls)
+
+
+def test_endpoint_migration_preserves_a_conflicting_namespaced_secret(tmp_path):
+    mod = _load()
+    first_id = "d" * 32
+    replacement_id = "e" * 32
+    generated_ids = iter((first_id, replacement_id))
+    destination = mod.EndpointStore.secret_key(first_id)
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets(
+        {mod.SECRET_KEY: "current-legacy", destination: "different-secret"}
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert secrets.values[destination] == "different-secret"
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == replacement_id
+    assert secrets.values[store.secret_key(replacement_id)] == "current-legacy"
+    assert secrets.values[destination] == "different-secret"
+
+
+def test_endpoint_explicit_secret_save_establishes_namespaced_authority(tmp_path):
+    mod = _load()
+    endpoint_id = "f" * 32
+    settings = _KeyedSettings(
+        {
+            mod.ENDPOINTS_KEY: _endpoint_model(mod, endpoint_id),
+        }
+    )
+    secrets = _KeyedSecrets({mod.SECRET_KEY: "legacy-secret"})
+    store = mod.EndpointStore(settings, secrets, _Files(str(tmp_path)))
+
+    updated = store.promote_secret(endpoint_id, "new-secret")
+
+    assert updated.active_endpoint.secret_source == (
+        mod.ENDPOINT_SECRET_SOURCE_ENDPOINT
+    )
+    assert store.resolve_secret(updated.active_endpoint) == "new-secret"
+    assert secrets.values[mod.SECRET_KEY] == "legacy-secret"
+    assert "new-secret" not in repr(settings.values)
+
+
+def test_endpoint_migration_rechecks_legacy_configuration_before_publication(
+    tmp_path,
+):
+    mod = _load()
+    first_id = "1" * 32
+    replacement_id = "2" * 32
+    first_configuration = {
+        "server_url": "https://first.example.test:8006",
+        "token_user": "automation@pve",
+        "token_id": "sshpilot",
+    }
+    second_configuration = {
+        **first_configuration,
+        "server_url": "https://second.example.test:8006",
+    }
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: second_configuration,
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        },
+        get_sequences={
+            mod.CONFIGURATION_KEY: [first_configuration, second_configuration]
+        },
+    )
+    generated_ids = iter((first_id, replacement_id))
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == replacement_id
+    assert collection.active_endpoint.configuration == second_configuration
+
+
+def test_endpoint_migration_rechecks_legacy_secret_before_publication(tmp_path):
+    mod = _load()
+    first_id = "3" * 32
+    replacement_id = "4" * 32
+    generated_ids = iter((first_id, replacement_id))
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets(
+        {mod.SECRET_KEY: "second-secret"},
+        get_sequences={mod.SECRET_KEY: ["first-secret", "second-secret"]},
+    )
+    store = mod.EndpointStore(
+        settings,
+        secrets,
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert secrets.values[store.secret_key(first_id)] == "first-secret"
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == replacement_id
+    assert secrets.values[store.secret_key(replacement_id)] == "second-secret"
+
+
+def test_endpoint_migration_rechecks_legacy_ca_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load()
+    first_id = "5" * 32
+    replacement_id = "6" * 32
+    first_ca = b"first-public-ca"
+    second_ca = b"second-public-ca"
+    source = tmp_path / mod.CUSTOM_CA_FILE
+    source.write_bytes(first_ca)
+    generated_ids = iter((first_id, replacement_id))
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    files = _Files(str(tmp_path))
+    original_path = files.path
+    source_reads = 0
+
+    def changing_path(relative):
+        nonlocal source_reads
+        if relative == mod.CUSTOM_CA_FILE:
+            source_reads += 1
+            if source_reads == 2:
+                source.write_bytes(second_ca)
+        return original_path(relative)
+
+    files.path = changing_path
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        files,
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+    assert (tmp_path / store.custom_ca_file(first_id)).read_bytes() == first_ca
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == replacement_id
+    assert (tmp_path / store.custom_ca_file(replacement_id)).read_bytes() == second_ca
+
+
+def test_endpoint_migration_retries_when_migration_id_write_fails(tmp_path):
+    mod = _load()
+    first_id = "7" * 32
+    second_id = "8" * 32
+    generated_ids = iter((first_id, second_id))
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        },
+        fail_set_once={mod.ENDPOINT_MIGRATION_ID_KEY},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINT_MIGRATION_ID_KEY not in settings.values
+    assert store.materialize_legacy().active_endpoint_id == second_id
+
+
+def test_endpoint_migration_reuses_id_written_before_readback_failure(tmp_path):
+    mod = _load()
+    endpoint_id = "9" * 32
+    allocations = []
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        },
+        set_then_fail_once={mod.ENDPOINT_MIGRATION_ID_KEY},
+    )
+
+    def allocate():
+        allocations.append(endpoint_id)
+        return endpoint_id
+
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=allocate,
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == endpoint_id
+    assert store.materialize_legacy().active_endpoint_id == endpoint_id
+    assert allocations == [endpoint_id]
+
+
+def test_endpoint_migration_recovers_when_model_write_precedes_readback_failure(
+    tmp_path,
+):
+    mod = _load()
+    endpoint_id = "a" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        },
+        set_then_fail_once={mod.ENDPOINTS_KEY},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: endpoint_id,
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert settings.values[mod.ENDPOINTS_KEY]["active_endpoint_id"] == endpoint_id
+    set_calls = list(settings.set_calls)
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == endpoint_id
+    assert settings.set_calls == set_calls
+
+
+def test_endpoint_migration_rechecks_journal_id_before_publication(tmp_path):
+    mod = _load()
+    first_id = "d" * 32
+    external_id = "e" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+            mod.ENDPOINT_MIGRATION_ID_KEY: external_id,
+        },
+        get_sequences={mod.ENDPOINT_MIGRATION_ID_KEY: [first_id, external_id]},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: pytest.fail("an existing journal id must be reused"),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == external_id
+
+
+def test_endpoint_migration_does_not_overwrite_a_concurrently_published_model(
+    tmp_path,
+):
+    mod = _load()
+    migration_id = "d" * 32
+    published_id = "e" * 32
+    published = _endpoint_model(mod, published_id)
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        },
+        get_sequences={mod.ENDPOINTS_KEY: [MISSING, published]},
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: migration_id,
+    )
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == published_id
+    assert not any(key == mod.ENDPOINTS_KEY for key, _value in settings.set_calls)
+
+
+def test_endpoint_migration_serializes_process_local_materialization(tmp_path):
+    mod = _load()
+    endpoint_id = "f" * 32
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: False,
+        }
+    )
+    secrets = _KeyedSecrets()
+    files = _Files(str(tmp_path))
+    first_allocation_started = mod.threading.Event()
+    second_allocation_started = mod.threading.Event()
+    release_first = mod.threading.Event()
+    second_call_started = mod.threading.Event()
+    allocation_count = 0
+    results = []
+    errors = []
+
+    def allocate():
+        nonlocal allocation_count
+        allocation_count += 1
+        if allocation_count == 1:
+            first_allocation_started.set()
+            if not release_first.wait(2):
+                raise RuntimeError("test synchronization failed")
+        else:
+            second_allocation_started.set()
+        return endpoint_id
+
+    stores = [
+        mod.EndpointStore(settings, secrets, files, id_factory=allocate),
+        mod.EndpointStore(settings, secrets, files, id_factory=allocate),
+    ]
+
+    def materialize(store, started=None):
+        if started is not None:
+            started.set()
+        try:
+            results.append(store.materialize_legacy())
+        except Exception as exc:
+            errors.append(exc)
+
+    first = mod.threading.Thread(target=materialize, args=(stores[0],))
+    second = mod.threading.Thread(
+        target=materialize,
+        args=(stores[1], second_call_started),
+    )
+    first.start()
+    assert first_allocation_started.wait(2)
+    second.start()
+    assert second_call_started.wait(2)
+    assert not second_allocation_started.wait(0.1)
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert allocation_count == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert results[0].active_endpoint_id == endpoint_id
+
+
+def test_endpoint_migration_rejects_invalid_legacy_ca_with_real_validator(tmp_path):
+    mod = _load()
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(
+        b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n"
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    with pytest.raises(mod.EndpointStorageError) as raised:
+        store.materialize_legacy()
+
+    assert str(raised.value) == "Endpoint storage is unavailable."
+    assert mod.ENDPOINTS_KEY not in settings.values
+
+
+def test_endpoint_migration_rejects_oversized_legacy_ca_before_publication(
+    tmp_path,
+):
+    mod = _load()
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(
+        b"x" * (mod.MAX_CUSTOM_CA_BYTES + 1)
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert mod.ENDPOINT_MIGRATION_ID_KEY not in settings.values
+    assert mod.ENDPOINTS_KEY not in settings.values
+
+
+def test_endpoint_migration_rejects_oversized_namespaced_ca(tmp_path, monkeypatch):
+    mod = _load()
+    first_id = "b" * 32
+    replacement_id = "c" * 32
+    generated_ids = iter((first_id, replacement_id))
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(b"public-ca")
+    destination = tmp_path / mod.EndpointStore.custom_ca_file(first_id)
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"x" * (mod.MAX_CUSTOM_CA_BYTES + 1))
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    with pytest.raises(mod.EndpointStorageError):
+        store.materialize_legacy()
+
+    assert destination.stat().st_size == mod.MAX_CUSTOM_CA_BYTES + 1
+    assert mod.ENDPOINTS_KEY not in settings.values
+    assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+
+    collection = store.materialize_legacy()
+
+    assert collection.active_endpoint_id == replacement_id
+    assert (
+        tmp_path / store.custom_ca_file(replacement_id)
+    ).read_bytes() == b"public-ca"
+
+
+@pytest.mark.parametrize(
+    ("same", "mode", "succeeds"),
+    [(True, 0o600, True), (False, 0o600, False), (True, 0o644, False)],
+)
+def test_endpoint_migration_handles_an_existing_namespaced_ca(
+    tmp_path,
+    monkeypatch,
+    same,
+    mode,
+    succeeds,
+):
+    mod = _load()
+    first_id = "d" * 32
+    replacement_id = "e" * 32
+    generated_ids = iter((first_id, replacement_id))
+    source_ca = b"public-ca"
+    target_ca = source_ca if same else b"different-ca"
+    settings = _KeyedSettings(
+        {
+            mod.CONFIGURATION_KEY: {},
+            mod.CUSTOM_CA_ENABLED_KEY: True,
+        }
+    )
+    (tmp_path / mod.CUSTOM_CA_FILE).write_bytes(source_ca)
+    destination = tmp_path / mod.EndpointStore.custom_ca_file(first_id)
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(target_ca)
+    destination.chmod(mode)
+    monkeypatch.setattr(
+        mod,
+        "validate_custom_ca_pem",
+        lambda value: value.decode("ascii") if isinstance(value, bytes) else value,
+    )
+    store = mod.EndpointStore(
+        settings,
+        _KeyedSecrets(),
+        _Files(str(tmp_path)),
+        id_factory=lambda: next(generated_ids),
+    )
+
+    if succeeds:
+        collection = store.materialize_legacy()
+        assert collection.active_endpoint_id == first_id
+    else:
+        with pytest.raises(mod.EndpointStorageError):
+            store.materialize_legacy()
+        assert mod.ENDPOINTS_KEY not in settings.values
+        assert settings.values[mod.ENDPOINT_MIGRATION_ID_KEY] == replacement_id
+
+        collection = store.materialize_legacy()
+        assert collection.active_endpoint_id == replacement_id
+        assert (
+            tmp_path / store.custom_ca_file(replacement_id)
+        ).read_bytes() == source_ca
+
+    assert destination.read_bytes() == target_ca
 
 
 def test_save_without_new_secret_only_writes_stripped_configuration():
